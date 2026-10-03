@@ -1,0 +1,27 @@
+{
+  "name": "@saturn/vark-mcp",
+  "version": "0.1.0",
+  "description": "Zero-rewrite bridge that wraps Anthropic Model Context Protocol (MCP) tools with vark protection.",
+  "type": "module",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\""
+  },
+  "dependencies": {
+    "@saturn/vark": "workspace:*"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "hello": "world",
+  "team": "saturn",
+  "runtime": "vark",
+  "items": ["alpha", "beta", "gamma"]
+}

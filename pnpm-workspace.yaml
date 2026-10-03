@@ -1,0 +1,6 @@
+packages:
+  - 'packages/*'
+
+# esbuild (used by tsx to run the demo) needs its install script.
+allowBuilds:
+  esbuild: true

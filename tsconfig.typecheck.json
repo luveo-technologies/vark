@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "@saturn/vark": ["./packages/core/src/index.ts"],
+      "@saturn/vark-mcp": ["./packages/mcp/src/index.ts"]
+    }
+  },
+  "include": ["packages/*/src/**/*", "examples/**/*.ts"]
+}
