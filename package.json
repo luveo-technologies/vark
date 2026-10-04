@@ -11,16 +11,34 @@
     "docs:check": "node examples/check-docs.mjs",
     "test": "vitest run",
     "typecheck": "tsc --noEmit -p tsconfig.typecheck.json",
+    "lint": "eslint packages/ --ext .ts",
+    "sbom": "pnpm dlx @cyclonedx/bom -o sbom.json",
     "clean": "pnpm --recursive run clean"
   },
   "dependencies": {
     "@saturn/vark": "workspace:*",
-    "@saturn/vark-mcp": "workspace:*"
+    "@saturn/vark-mcp": "workspace:*",
+    "commander": "^15.0.0",
+    "picocolors": "^1.1.1"
   },
   "devDependencies": {
     "@types/node": "^22.13.5",
     "tsx": "^4.19.3",
     "typescript": "^5.8.2",
     "vitest": "2.1.9"
+  },
+  "files": [
+    "dist",
+    "docs",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "publishConfig": {
+    "provenance": true,
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }
