@@ -69,32 +69,13 @@ async function loadPayload(file: string): Promise<unknown> {
   const content = await readFile(file, 'utf8');
   const ext = extname(file).toLowerCase();
 
-  try {
-    if (ext === '.json') {
-      return JSON.parse(content);
-    } else if (ext === '.yaml' || ext === '.yml') {
-      // Simple YAML parsing - in production, use a proper YAML parser
-      // For now, we'll just try JSON.parse as YAML is a superset of JSON
-      // In production, use js-yaml or similar
-      return parseYaml(content);
-    } else {
-      throw new Error(`Unsupported file format: ${ext}`);
-    }
-  } catch (error) {
-    throw new Error(`Failed to parse ${file}: ${error instanceof Error ? error.message : String(error)}`);
+  if (ext !== '.json') {
+    throw new Error(`Unsupported file format: ${ext} (payload files must be JSON)`);
   }
-}
-
-// Simple YAML parser for basic cases - in production use js-yaml
-function parseYaml(content: string): unknown {
-  // Very basic YAML support - for production use js-yaml
-  // This handles simple key: value and nested objects
-  // For now, we'll try JSON.parse first (YAML is a superset of JSON)
   try {
     return JSON.parse(content);
-  } catch {
-    // If it's not valid JSON, throw an error for now
-    throw new Error('YAML parsing not fully implemented. Please use JSON format or install js-yaml.');
+  } catch (error) {
+    throw new Error(`Failed to parse ${file}: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -155,7 +136,12 @@ async function runSingleCheck(
   }
 }
 
-export function printCheckResults(results: CheckResult[], elapsedMs?: number): void {
+export interface PrintCheckOptions {
+  elapsedMs?: number;
+  verbose?: boolean;
+}
+
+export function printCheckResults(results: CheckResult[], opts: PrintCheckOptions = {}): void {
   printBanner('check  ·  dry-run payloads against the 8 gates');
 
   const passed = results.filter((r) => r.success).length;
@@ -174,6 +160,10 @@ export function printCheckResults(results: CheckResult[], elapsedMs?: number): v
       if (result.reason) {
         console.log(`  ${yellow('Reason:')} ${result.reason}`);
       }
+      if (opts.verbose && result.blockedBy) {
+        const hint = VERBOSE_HINTS[result.blockedBy];
+        if (hint) console.log(`  ${dim(`hint: ${hint} (vark explain ${result.blockedBy})`)}`);
+      }
     }
   }
 
@@ -184,10 +174,21 @@ export function printCheckResults(results: CheckResult[], elapsedMs?: number): v
         : `${green(`✔ ${passed} passed`)}  ${red(`✘ ${failed} blocked`)}`,
       dim(progressBar(passed, results.length)),
     ],
-    elapsedMs,
+    opts.elapsedMs,
   );
 
   if (failed > 0) {
     process.exitCode = 1;
   }
 }
+
+/** One-line remediation pointers shown under `--verbose` refusals. */
+const VERBOSE_HINTS: Record<string, string> = {
+  LOOP_BLOCKED: 'vary the arguments or raise maxIdenticalCalls',
+  CAPABILITY_VIOLATION: 'widen the filesystem grant or network allowlist',
+  CIRCUIT_BREAKER: 'pass argv arrays, never shell strings',
+  DLP_REDACTED: 'rotate the credential; it never reached the tool',
+  INDIRECT_INJECTION: 'treat tool output as untrusted input',
+  TIMEOUT: 'raise maxExecutionMs or split the work',
+  EXECUTION_ERROR: 'compare args against the tool schema',
+};

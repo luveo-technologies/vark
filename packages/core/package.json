@@ -1,5 +1,5 @@
 {
-  "name": "@saturn/vark",
+  "name": "@luveo-tech/vark",
   "version": "0.1.0",
   "description": "High-performance, token-optimized, zero-trust security runtime and firewall for AI agent tool calls.",
   "type": "module",

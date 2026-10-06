@@ -1,12 +1,12 @@
-# Contributing to @saturn/vark
+# Contributing to @luveo-tech/vark
 
-Thank you for your interest in contributing to `@saturn/vark`!
+Thank you for your interest in contributing to `@luveo-tech/vark`!
 
 ## Development Setup
 
 ```bash
 # Clone the repository
-git clone https://github.com/saturn-security/vark.git
+git clone https://github.com/luveo-technologies/vark.git
 cd vark
 
 # Install dependencies

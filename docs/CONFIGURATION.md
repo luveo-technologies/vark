@@ -210,7 +210,7 @@ interface SiemConfig {
 ## Complete Example
 
 ```ts
-import { VarkRuntime } from '@saturn/vark';
+import { VarkRuntime } from '@luveo-tech/vark';
 
 const runtime = new VarkRuntime({
   isolation: 'wasm',

@@ -185,6 +185,37 @@ describe('vark policy test', () => {
     expect(failed).toBe(1);
   });
 
+  it('actually evaluates the run body instead of echoing args', async () => {
+    const path = await writeFixture(
+      'policy-eval.json',
+      JSON.stringify({
+        config: {},
+        tools: [
+          {
+            name: 'boom',
+            description: 'Always throws.',
+            schema: { type: 'object', properties: {} },
+            run: 'throw new Error("boom");',
+          },
+        ],
+        tests: [
+          {
+            name: 'throwing body fails the call',
+            tool: 'boom',
+            args: {},
+            shouldAllow: true,
+          },
+        ],
+      }),
+    );
+    // With real evaluation the body throws → EXECUTION_ERROR → assertion fails.
+    // (The old mock ignored the body and would have passed.)
+    const { passed, failed, results } = await runPolicyTest(path);
+    expect(passed).toBe(0);
+    expect(failed).toBe(1);
+    expect(results[0]!.actual.blockedBy).toBe('EXECUTION_ERROR');
+  });
+
   it('reports zero tests when the policy has no test suite', async () => {
     const path = await writeFixture('no-tests.json', JSON.stringify({ config: {} }));
     const { passed, failed, results } = await runPolicyTest(path);

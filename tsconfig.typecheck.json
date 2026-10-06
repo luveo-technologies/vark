@@ -4,8 +4,8 @@
     "noEmit": true,
     "baseUrl": ".",
     "paths": {
-      "@saturn/vark": ["./packages/core/src/index.ts"],
-      "@saturn/vark-mcp": ["./packages/mcp/src/index.ts"]
+      "@luveo-tech/vark": ["./packages/core/src/index.ts"],
+      "@luveo-tech/vark-mcp": ["./packages/mcp/src/index.ts"]
     }
   },
   "include": ["packages/*/src/**/*", "examples/**/*.ts"]

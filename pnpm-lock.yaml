@@ -8,10 +8,10 @@ importers:
 
   .:
     dependencies:
-      '@saturn/vark':
+      '@luveo-tech/vark':
         specifier: workspace:*
         version: link:packages/core
-      '@saturn/vark-mcp':
+      '@luveo-tech/vark-mcp':
         specifier: workspace:*
         version: link:packages/mcp
       commander:
@@ -45,7 +45,7 @@ importers:
 
   packages/mcp:
     dependencies:
-      '@saturn/vark':
+      '@luveo-tech/vark':
         specifier: workspace:*
         version: link:../core
 

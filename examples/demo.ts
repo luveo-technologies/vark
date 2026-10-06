@@ -13,9 +13,9 @@ import {
   analyzeCompression,
   benchmarkInspection,
   inspectPayload,
-} from '@saturn/vark';
-import type { ToolExecutionResult } from '@saturn/vark';
-import { VarkMCPAdapter } from '@saturn/vark-mcp';
+} from '@luveo-tech/vark';
+import type { ToolExecutionResult } from '@luveo-tech/vark';
+import { VarkMCPAdapter } from '@luveo-tech/vark-mcp';
 
 /* ── terminal helpers ──────────────────────────────────────────────────── */
 

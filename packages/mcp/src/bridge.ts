@@ -19,7 +19,7 @@
  * ```
  */
 
-import { VarkRuntime } from '@saturn/vark';
+import { VarkRuntime } from '@luveo-tech/vark';
 import type {
   CapabilityConfig,
   CompressionReport,
@@ -29,8 +29,8 @@ import type {
   InspectionResult,
   ToolExecutionResult,
   VarkConfig,
-} from '@saturn/vark';
-import { VarkError } from '@saturn/vark';
+} from '@luveo-tech/vark';
+import { VarkError } from '@luveo-tech/vark';
 
 /** Shape of a raw MCP (or OpenAI-style function) tool descriptor. */
 export interface MCPToolLike {

@@ -2,13 +2,13 @@
 
 ## High-Level Overview
 
-`@saturn/vark` is a zero-trust security runtime and firewall for AI agent tool calls. It sits between the LLM/agent loop and your tools, enforcing an 8-gate security pipeline on every tool invocation.
+`@luveo-tech/vark` is a zero-trust security runtime and firewall for AI agent tool calls. It sits between the LLM/agent loop and your tools, enforcing an 8-gate security pipeline on every tool invocation.
 
 ```
    LLM / agent loop
         │  tool call (name + args)
         ▼
-   ┌────────────────────────── @saturn/vark ───────────────────────────┐
+   ┌────────────────────────── @luveo-tech/vark ───────────────────────────┐
    │  1 anomaly → 2 sandbox → 3 breaker → 4 in-DLP → 5 exec           │
    │  → 6 out-DLP → 7 injection filter → 8 audit                       │
    └────────────────────────────────────────────────────────────────────┘

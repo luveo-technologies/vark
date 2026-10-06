@@ -1,5 +1,5 @@
 /**
- * `@saturn/vark-mcp` — zero-rewrite bridge between Anthropic Model Context
+ * `@luveo-tech/vark-mcp` — zero-rewrite bridge between Anthropic Model Context
  * Protocol tool descriptors and the vark guard pipeline.
  */
 

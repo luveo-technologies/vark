@@ -1,8 +1,8 @@
-# `@saturn/vark` — Documentation
+# `@luveo-tech/vark` — Documentation
 
 **Zero-trust security runtime and firewall for AI agent tool calls.**
 
-> Production reference for `@saturn/vark` (core) and `@saturn/vark-mcp`
+> Production reference for `@luveo-tech/vark` (core) and `@luveo-tech/vark-mcp`
 > (Anthropic Model Context Protocol bridge). Covers architecture, the 8-gate
 > pipeline, the complete API surface, configuration defaults, the Compact Tool
 > Protocol, security guarantees, and measured performance.
@@ -40,7 +40,7 @@ It sits **between the model and your tools**:
    LLM / agent loop
         │  tool call (name + args)
         ▼
-   ┌────────────────────────── @saturn/vark ───────────────────────────┐
+   ┌────────────────────────── @luveo-tech/vark ───────────────────────────┐
    │  1 anomaly → 2 sandbox → 3 breaker → 4 in-DLP → 5 exec           │
    │  → 6 out-DLP → 7 injection filter → 8 audit                       │
    └────────────────────────────────────────────────────────────────────┘
@@ -86,20 +86,20 @@ It sits **between the model and your tools**:
 | Node.js | **≥ 20** (`engines.node: ">=20"`) |
 | Module system | **ESM only** (`"type": "module"`) — use `import`, not `require` |
 | TypeScript | 5.x, strict mode (types ship in the package) |
-| Runtime deps | **none** — `@saturn/vark` has zero runtime dependencies |
+| Runtime deps | **none** — `@luveo-tech/vark` has zero runtime dependencies |
 
 ### Install
 
 ```bash
 # pnpm (recommended)
-pnpm add @saturn/vark
-pnpm add @saturn/vark-mcp      # optional: Anthropic MCP bridge
+pnpm add @luveo-tech/vark
+pnpm add @luveo-tech/vark-mcp      # optional: Anthropic MCP bridge
 
 # npm
-npm install @saturn/vark @saturn/vark-mcp
+npm install @luveo-tech/vark @luveo-tech/vark-mcp
 
 # yarn
-yarn add @saturn/vark @saturn/vark-mcp
+yarn add @luveo-tech/vark @luveo-tech/vark-mcp
 ```
 
 > **Working inside this repository?** The packages are local workspace
@@ -110,7 +110,7 @@ yarn add @saturn/vark @saturn/vark-mcp
 ### 5-line quickstart
 
 ```ts
-import { VarkRuntime } from '@saturn/vark';
+import { VarkRuntime } from '@luveo-tech/vark';
 
 const runtime = new VarkRuntime({ defaultCapabilities: { filesystem: { allow: ['./workspace/*'] } } });
 const read = runtime.tool({ name: 'read_file', description: 'Read a UTF-8 file.', schema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }, run: (a, ctx) => ctx.sandbox.readFile(a.path) });
@@ -125,7 +125,7 @@ That is the whole integration surface: **register a tool, call `execute`.**
 ### Your first guarded tool, annotated
 
 ```ts
-import { VarkRuntime } from '@saturn/vark';
+import { VarkRuntime } from '@luveo-tech/vark';
 
 const runtime = new VarkRuntime({
   isolation: 'process',
@@ -507,7 +507,7 @@ both redacted a secret *and* stripped an injection payload is reported as
 ### 4.1 `new VarkRuntime(config?: VarkConfig)`
 
 ```ts
-import { VarkRuntime } from '@saturn/vark';
+import { VarkRuntime } from '@luveo-tech/vark';
 const runtime = new VarkRuntime({ /* VarkConfig */ });
 ```
 
@@ -693,7 +693,7 @@ Payload walking is depth-capped at 12.
 Standalone API:
 
 ```ts
-import { redactText, redactValue, scanSecrets } from '@saturn/vark';
+import { redactText, redactValue, scanSecrets } from '@luveo-tech/vark';
 
 redactText(text, config?): DlpScanResult    // { text, redacted, types, matches }
 redactValue(value, config?): DlpValueResult // { value, redacted, types } — deep copy, input untouched
@@ -709,7 +709,7 @@ scanSecrets(text, config?): DlpMatch[]      // matches only, no mutation
 | `customRules` | `ReadonlyArray<(text) => boolean \| string>` | `[]` | Detection-only |
 
 ```ts
-import { scanIndirectInjection, sanitizeIndirectInjection, INJECTION_MARKER } from '@saturn/vark';
+import { scanIndirectInjection, sanitizeIndirectInjection, INJECTION_MARKER } from '@luveo-tech/vark';
 
 scanIndirectInjection(text, config?): InjectionScanResult   // { triggered, findings, reasons, sanitized }
 sanitizeIndirectInjection(value, config?): InjectionValueResult // { value, triggered, removed, reasons }
@@ -851,7 +851,7 @@ CTP rewrites a JSON Schema as a minified TypeScript signature the model reads
 in a fraction of the tokens while staying unambiguous:
 
 ```ts
-import { compressSchema, analyzeCompression } from '@saturn/vark';
+import { compressSchema, analyzeCompression } from '@luveo-tech/vark';
 
 compressSchema('read_file', 'Read a UTF-8 text file.', {
   type: 'object',
@@ -930,7 +930,7 @@ wrappedTool.compact;                // on any WrappedTool / WrappedMCPTool
 
 ## 6. Anthropic MCP Integration
 
-**Package:** `@saturn/vark-mcp`
+**Package:** `@luveo-tech/vark-mcp`
 
 MCP exposes *schema-only* descriptors (`{ name, description, inputSchema }`);
 the real call is a `tools/call` round trip against the MCP server. The adapter
@@ -941,8 +941,8 @@ signature.
 ### `VarkMCPAdapter`
 
 ```ts
-import { VarkRuntime } from '@saturn/vark';
-import { VarkMCPAdapter } from '@saturn/vark-mcp';
+import { VarkRuntime } from '@luveo-tech/vark';
+import { VarkMCPAdapter } from '@luveo-tech/vark-mcp';
 
 const runtime = new VarkRuntime();        // your guards, sessions, audit chain
 
@@ -996,7 +996,7 @@ tools on the same chain).
 **Functional shorthand:**
 
 ```ts
-import { wrapMCPTools } from '@saturn/vark-mcp';
+import { wrapMCPTools } from '@luveo-tech/vark-mcp';
 const tools = wrapMCPTools(mcpTools, defaultCapabilities, { runtime, executor });
 ```
 
@@ -1021,7 +1021,7 @@ warm-up) on the reference machine:
 | max | 1.5806 ms *(GC / OS scheduler pause — not the inspection itself)* |
 
 ```ts
-import { benchmarkInspection } from '@saturn/vark';
+import { benchmarkInspection } from '@luveo-tech/vark';
 
 const bench = benchmarkInspection({ command: 'cat file.txt; rm -rf /' }, undefined, 20_000);
 // { iterations, avgMs, p50Ms, p99Ms, maxMs, safe, reason? }
@@ -1095,6 +1095,33 @@ Takeaways:
 ---
 
 ## 8. Recipes
+
+### CLI quick tour
+
+The `vark` binary (shipped in `@luveo-tech/vark`) exposes the engine to shells
+and CI. Full reference: [`docs/CLI.md`](./docs/CLI.md).
+
+```bash
+vark check payload.json            # dry-run (globs, --watch, -v remediation hints)
+vark scan "Ignore all rules…"      # per-stage detection pipeline
+vark bench                         # p99 budget table (exit 1 if over)
+vark audit verify audit.jsonl      # hash-chain VALID/CORRUPTED + first break
+vark audit tail audit.jsonl -f     # live color-coded stream
+vark audit export audit.jsonl --format html -o report.html
+vark policy test policy.vark.json  # shouldAllow/shouldBlock assertions
+vark policy lint policy.vark.json  # static validation
+vark policy init ./policies        # scaffold starter policy
+vark canary                        # honeytoken trap demo
+vark pii leaked.txt                # PII anonymization preview
+vark entropy page.html             # prompt-leak reflection report
+vark compress schema.json --name read_file
+vark session stats audit.jsonl     # per-session call/block table
+vark explain CIRCUIT_BREAKER       # why a gate fires + how to fix it
+vark doctor                        # readiness check
+```
+
+Exit `0` on pass, `1` on any block/corruption/failure. Output degrades to
+plain lines when stdout is not a TTY.
 
 ### Multi-agent sessions
 
@@ -1297,7 +1324,7 @@ Both packages are `0.1.0` workspace packages in this monorepo, consumed via
 ```text
 vark/
 ├── packages/
-│   ├── core/                 @saturn/vark
+│   ├── core/                 @luveo-tech/vark
 │   │   └── src/
 │   │       ├── runtime.ts               8-gate pipeline (VarkRuntime)
 │   │       ├── circuit-breaker.ts        sub-ms payload firewall + benchmark
@@ -1309,7 +1336,7 @@ vark/
 │   │       ├── compressor.ts             Compact Tool Protocol
 │   │       ├── types.ts                  all public interfaces + errors
 │   │       └── index.ts                  public export surface
-│   └── mcp/                  @saturn/vark-mcp
+│   └── mcp/                  @luveo-tech/vark-mcp
 │       └── src/bridge.ts                 VarkMCPAdapter (zero-rewrite)
 ├── examples/
 │   ├── demo.ts               9 gated scenarios
@@ -1327,7 +1354,7 @@ vark/
 | --- | --- |
 | `pnpm install` | Install workspace dependencies |
 | `pnpm build` | Build every package (`tsc`, ESM + `.d.ts`) |
-| `pnpm --filter @saturn/vark build` | Build only the core package |
+| `pnpm --filter @luveo-tech/vark build` | Build only the core package |
 | `pnpm demo` | Build, then run `examples/demo.ts` |
 | `pnpm bench` | Measure DLP / injection scanner latency incl. adversarial input |
 | `pnpm docs:check` | Lint `DOCUMENTATION.md` — table alignment, code fences, internal anchors |

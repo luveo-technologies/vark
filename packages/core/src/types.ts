@@ -1,5 +1,5 @@
 /**
- * Core interfaces & type definitions for `@saturn/vark`.
+ * Core interfaces & type definitions for `@luveo-tech/vark`.
  *
  * Everything an integrator needs to describe a tool, its privileges, and the
  * result of a guarded execution.

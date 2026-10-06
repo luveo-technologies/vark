@@ -1,9 +1,9 @@
 /**
- * `@saturn/vark` — zero-trust security runtime for AI agent tool calls.
+ * `@luveo-tech/vark` — zero-trust security runtime for AI agent tool calls.
  *
  * @example
  * ```ts
- * import { VarkRuntime } from '@saturn/vark';
+ * import { VarkRuntime } from '@luveo-tech/vark';
  *
  * const runtime = new VarkRuntime({
  *   defaultCapabilities: { filesystem: { allow: ['./workspace/*'] } },

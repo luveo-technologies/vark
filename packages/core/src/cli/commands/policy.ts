@@ -67,14 +67,12 @@ export async function runPolicyTest(
   // Register tools from policy
   if (policy.tools) {
     for (const toolDef of policy.tools) {
-      // Create a mock run function from the string
-      const runFn = createMockRunFunction(toolDef.run);
       runtime.tool({
         name: toolDef.name,
         description: toolDef.description,
         schema: toolDef.schema,
         capabilities: toolDef.capabilities,
-        run: runFn,
+        run: createTestRunFunction(toolDef.run),
       });
     }
   }
@@ -97,36 +95,37 @@ async function loadPolicy(filePath: string): Promise<PolicyFile> {
   const content = await readFile(filePath, 'utf8');
   const ext = extname(filePath).toLowerCase();
 
+  if (ext !== '.json') {
+    throw new Error(`Unsupported file format: ${ext} (policy files must be JSON)`);
+  }
   try {
-    if (ext === '.json') {
-      return JSON.parse(content) as PolicyFile;
-    } else if (ext === '.yaml' || ext === '.yml') {
-      return parseYaml(content) as PolicyFile;
-    } else {
-      throw new Error(`Unsupported file format: ${ext}`);
-    }
+    return JSON.parse(content) as PolicyFile;
   } catch (error) {
     throw new Error(`Failed to parse ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
-// Simple YAML parser - in production use js-yaml
-function parseYaml(content: string): unknown {
-  try {
-    return JSON.parse(content);
-  } catch {
-    throw new Error('YAML parsing not fully implemented. Please use JSON format or install js-yaml.');
-  }
-}
-
-function createMockRunFunction(_body: string): (args: unknown, context: { sandbox: { readFile: (path: string) => Promise<string>; fetch: (url: string, init?: RequestInit) => Promise<Response> } }) => Promise<unknown> {
-  // Create a mock run function from the string body
-  // In production, this would be more sophisticated
-  return async (args: unknown, _context: { sandbox: { readFile: (path: string) => Promise<string>; fetch: (url: string, init?: RequestInit) => Promise<Response> } }) => {
-    // For testing, we'll just return the args or a mock response
-    // The actual implementation would evaluate the function body
-    return { args, mock: true };
-  };
+/**
+ * Compile a tool's `run` string into a real function for policy tests.
+ *
+ * Test-harness only: the body runs with `args` as its sole in-scope
+ * variable (e.g. `"return args;"` or `"return { echo: args };"`). This is
+ * never used by the production pipeline — `vark policy test` executes the
+ * body so assertions exercise the same gates a live call would hit.
+ */
+function createTestRunFunction(
+  body: string,
+): (
+  args: unknown,
+  context: {
+    sandbox: {
+      readFile: (path: string) => Promise<string>;
+      fetch: (url: string, init?: RequestInit) => Promise<Response>;
+    };
+  },
+) => Promise<unknown> {
+  const fn = new Function('args', body) as (args: unknown) => unknown;
+  return async (args: unknown) => fn(args);
 }
 
 async function runSingleTest(

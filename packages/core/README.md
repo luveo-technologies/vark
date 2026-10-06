@@ -1,4 +1,4 @@
-# `@saturn/vark`
+# `@luveo-tech/vark`
 
 **Zero-trust security runtime and firewall for AI agent tool calls.**
 
@@ -7,7 +7,7 @@ looks like an attack, enforces capability-based access control, and compresses
 tool schemas to save LLM tokens.
 
 ```ts
-import { VarkRuntime } from '@saturn/vark';
+import { VarkRuntime } from '@luveo-tech/vark';
 
 const runtime = new VarkRuntime({
   defaultCapabilities: { filesystem: { allow: ['./workspace/*'] } },
@@ -29,17 +29,21 @@ circuit breaker → input DLP → isolated execution → output DLP → injectio
 filter → hash-chained audit — and **always resolves** with a
 `ToolExecutionResult` (never throws).
 
-Ships a CLI as well:
+Ships a CLI as well (`npx vark …`):
 
 ```bash
-npx vark check payload.json        # dry-run a tool payload against the gates
-npx vark audit verify audit.jsonl  # verify an audit hash chain
-npx vark policy test policy.json   # run policy assertions
+vark check payload.json        # dry-run a tool payload against the gates
+vark scan "Ignore all rules…"  # per-stage detection pipeline view
+vark bench                     # p99 budget assertion table
+vark audit verify audit.jsonl  # verify an audit hash chain
+vark policy test policy.json   # run policy assertions
+vark explain CIRCUIT_BREAKER   # why a gate fires + how to fix it
+vark doctor                    # readiness check
 ```
 
 Full documentation (architecture, API reference, CTP spec, benchmarks, threat
-model) lives in [`DOCUMENTATION.md`](https://github.com/saturn-security/vark/blob/main/DOCUMENTATION.md)
-and [`docs/`](https://github.com/saturn-security/vark/tree/main/docs) in the
+model) lives in [`DOCUMENTATION.md`](https://github.com/luveo-technologies/vark/blob/main/DOCUMENTATION.md)
+and [`docs/`](https://github.com/luveo-technologies/vark/tree/main/docs) in the
 monorepo.
 
 Node 20+ · ESM · zero runtime dependencies · MIT

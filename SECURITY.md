@@ -8,11 +8,11 @@
 
 ## Vulnerability Disclosure
 
-We take the security of `@saturn/vark` seriously. If you discover a security vulnerability, please report it responsibly.
+We take the security of `@luveo-tech/vark` seriously. If you discover a security vulnerability, please report it responsibly.
 
 ### Reporting Process
 
-1. **Email**: Send details to `security@saturn.ai`
+1. **Email**: Send details to `support@saturn.luveo.net`
 2. **Subject**: `[vark-security] <brief description>`
 3. **Include**:
    - Description of the vulnerability

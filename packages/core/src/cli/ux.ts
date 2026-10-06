@@ -1,80 +1,13 @@
 /**
- * Shared terminal UX for the vark CLI.
+ * Shared terminal output helpers for the vark CLI.
  *
- * Dependency-free: spinner, progress bar, banners and timing helpers.
- * Everything degrades gracefully when stdout is not a TTY (CI, pipes) —
- * no animation, no cursor rewriting, just plain lines.
+ * Plain, static, dependency-free formatting: progress bars, banners, tables
+ * and timing helpers. No animation, no screen clearing, no cursor rewriting —
+ * every command prints straight lines that work identically on a TTY and in CI.
  */
 
 import pkg from 'picocolors';
-const { cyan, dim, bold } = pkg;
-
-/** True when we can safely animate (TTY, not CI, sane terminal). */
-export function isAnimated(): boolean {
-  return (
-    Boolean(process.stdout.isTTY) &&
-    !process.env['CI'] &&
-    !process.env['NO_COLOR'] &&
-    process.env['TERM'] !== 'dumb'
-  );
-}
-
-const FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-
-export interface Spinner {
-  /** Replace the label while running. */
-  update(label: string): void;
-  /** Stop with a success line. */
-  succeed(message?: string): void;
-  /** Stop with a failure line. */
-  fail(message?: string): void;
-  /** Stop silently (caller prints its own summary). */
-  stop(): void;
-}
-
-/**
- * Start an animated spinner. In non-TTY mode it prints nothing until
- * `succeed()` / `fail()` (single line), keeping CI logs clean.
- */
-export function spinner(label: string): Spinner {
-  if (!isAnimated()) {
-    return {
-      update: () => undefined,
-      succeed: (message?: string) => console.log(dim(`  ✓ ${message ?? label}`)),
-      fail: (message?: string) => console.log(`  ✗ ${message ?? label}`),
-      stop: () => undefined,
-    };
-  }
-
-  let frame = 0;
-  let current = label;
-  const timer = setInterval(() => {
-    process.stdout.write(`\r${cyan(FRAMES[frame % FRAMES.length])} ${current}`);
-    frame += 1;
-  }, 80);
-
-  const clear = (): void => {
-    clearInterval(timer);
-    process.stdout.write('\r\x1b[K');
-  };
-
-  return {
-    update: (next: string) => {
-      current = next;
-    },
-    succeed: (message?: string) => {
-      clear();
-      console.log(`  ${cyan('✓')} ${message ?? current}`);
-    },
-    fail: (message?: string) => {
-      clear();
-      console.log(`  ✗ ${message ?? current}`);
-    },
-    stop: () => {
-      clear();
-    },
-  };
-}
+const { dim, bold, green, red, yellow } = pkg;
 
 /** `██████░░░░ 3/5 (60%)` */
 export function progressBar(done: number, total: number, width = 20): string {
@@ -125,4 +58,96 @@ export function chainDots(
   }
   if (total > maxDots) dots.push(dim(`…${total}`));
   return dots.join('');
+}
+
+// ── gate pipeline view ──────────────────────────────────────────────────────
+
+export type GateStatus = 'pass' | 'fail' | 'skip' | 'pending';
+
+export interface GateState {
+  /** Short gate id, e.g. `breaker`, `in-dlp`. */
+  id: string;
+  /** Human label, e.g. `Circuit Breaker`. */
+  label: string;
+  status: GateStatus;
+  /** One-line detail shown under the gate. */
+  detail?: string;
+  /** Marker shown on failed gates. @default '← BLOCKED' */
+  marker?: string;
+}
+
+function gateGlyph(status: GateStatus): string {
+  switch (status) {
+    case 'pass':
+      return green('●');
+    case 'fail':
+      return red('✖');
+    case 'skip':
+      return dim('○');
+    case 'pending':
+      return dim('◌');
+  }
+}
+
+/**
+ * Render the 8-gate pipeline as it fires:
+ *
+ *   ● anomaly      ok · 3 calls in window
+ *   ● sandbox      path ./a.json inside ./workspace/*
+ *   ✖ breaker      command separator (;)      ← BLOCKED
+ *   ○ in-dlp       skipped (short-circuit)
+ *   …
+ */
+export function renderPipeline(states: GateState[]): string {
+  const rows: string[] = [];
+  for (let i = 0; i < states.length; i += 1) {
+    const gate = states[i]!;
+    const connector = i === states.length - 1 ? ' ' : '│';
+    const head = `  ${gateGlyph(gate.status)} ${gate.label.padEnd(16)}`;
+    const detail = gate.detail ? dim(gate.detail) : '';
+    const marker = gate.status === 'fail' ? red(`  ${gate.marker ?? '← BLOCKED'}`) : '';
+    rows.push(`${head} ${detail}${marker}`);
+    if (i < states.length - 1) rows.push(dim(`  ${connector}`));
+  }
+  return rows.join('\n');
+}
+
+/** Simple column table: `table([['a','b'],…])` with auto widths. */
+export function table(
+  rows: Array<Array<string | number>>,
+  options: { gap?: number; head?: boolean } = {},
+): string {
+  if (rows.length === 0) return '';
+  const gap = ' '.repeat(options.gap ?? 3);
+  const widths: number[] = [];
+  for (const row of rows) {
+    row.forEach((cell, i) => {
+      const len = String(cell).replace(/\u001b\[[0-9;]*m/g, '').length;
+      widths[i] = Math.max(widths[i] ?? 0, len);
+    });
+  }
+  const lines = rows.map((row, r) => {
+    const line = row
+      .map((cell, i) => {
+        const raw = String(cell);
+        const plain = raw.replace(/\u001b\[[0-9;]*m/g, '');
+        return raw + ' '.repeat(Math.max(0, (widths[i] ?? 0) - plain.length));
+      })
+      .join(gap);
+    return options.head && r === 0 ? bold(line) : line;
+  });
+  return lines.join('\n');
+}
+
+/** Horizontal histogram bar: `ALLOWED      ████████░░ 6`. */
+export function histoBar(label: string, count: number, max: number, width = 12): string {
+  const filled = max <= 0 ? 0 : Math.round((count / max) * width);
+  return `${label.padEnd(18)} ${green('█'.repeat(filled))}${dim('░'.repeat(width - filled))} ${count}`;
+}
+
+/** Decision → colored chip. */
+export function decisionChip(decision: string): string {
+  if (decision === 'ALLOWED') return green('ALLOWED ');
+  if (decision === 'LOOP_BLOCKED' || decision === 'TIMEOUT') return yellow(decision.padEnd(8));
+  return red(decision.padEnd(8));
 }

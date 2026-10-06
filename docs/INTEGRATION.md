@@ -3,7 +3,7 @@
 ## LangChain Integration
 
 ```ts
-import { VarkRuntime } from '@saturn/vark';
+import { VarkRuntime } from '@luveo-tech/vark';
 import { DynamicTool } from 'langchain/tools';
 
 const runtime = new VarkRuntime({
@@ -28,7 +28,7 @@ const agent = await initializeAgentExecutor([varkTool], llm, 'chat-conversationa
 ## LlamaIndex Integration
 
 ```ts
-import { VarkRuntime } from '@saturn/vark';
+import { VarkRuntime } from '@luveo-tech/vark';
 import { Tool } from 'llamaindex';
 
 const runtime = new VarkRuntime();
@@ -51,7 +51,7 @@ const varkTool = new Tool({
 ## Saturn AI Integration
 
 ```ts
-import { VarkRuntime } from '@saturn/vark';
+import { VarkRuntime } from '@luveo-tech/vark';
 
 const runtime = new VarkRuntime({
   isolation: 'wasm',
@@ -72,7 +72,7 @@ const tools = runtime.list().map(tool => ({
 ## Custom Agent Loop
 
 ```ts
-import { VarkRuntime } from '@saturn/vark';
+import { VarkRuntime } from '@luveo-tech/vark';
 
 const runtime = new VarkRuntime({
   circuitBreaker: { blockShellInjection: true, blockPathTraversal: true },
@@ -110,8 +110,8 @@ async function agentLoop(userMessage: string) {
 ## Anthropic MCP Integration
 
 ```ts
-import { VarkRuntime } from '@saturn/vark';
-import { VarkMCPAdapter } from '@saturn/vark-mcp';
+import { VarkRuntime } from '@luveo-tech/vark';
+import { VarkMCPAdapter } from '@luveo-tech/vark-mcp';
 
 const runtime = new VarkRuntime();
 
@@ -132,7 +132,7 @@ const result = await tools[0].execute({ url: 'https://docs.example.com/intro' })
 
 ```ts
 import express from 'express';
-import { VarkRuntime } from '@saturn/vark';
+import { VarkRuntime } from '@luveo-tech/vark';
 
 const app = express();
 const runtime = new VarkRuntime();
@@ -155,7 +155,7 @@ app.use('/api/tools', async (req, res, next) => {
 
 ```ts
 // app/api/tools/route.ts
-import { VarkRuntime } from '@saturn/vark';
+import { VarkRuntime } from '@luveo-tech/vark';
 
 const runtime = new VarkRuntime({
   defaultCapabilities: { network: false },

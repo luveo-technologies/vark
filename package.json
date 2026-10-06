@@ -16,8 +16,8 @@
     "clean": "pnpm --recursive run clean"
   },
   "dependencies": {
-    "@saturn/vark": "workspace:*",
-    "@saturn/vark-mcp": "workspace:*",
+    "@luveo-tech/vark": "workspace:*",
+    "@luveo-tech/vark-mcp": "workspace:*",
     "commander": "^15.0.0",
     "picocolors": "^1.1.1"
   },
