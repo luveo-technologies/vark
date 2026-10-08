@@ -52,9 +52,21 @@ interface GateDoc {
 const GATE_DOCS: GateDoc[] = [
   {
     gate: 'LOOP_BLOCKED',
-    when: 'Same tool + identical args more than maxIdenticalCalls (default 3), or velocity/budget exceeded.',
+    when: 'Same tool + identical args more than maxIdenticalCalls (default 3).',
     why: 'Stops runaway agents before they burn downstream budget or exfiltrate in a loop.',
     fix: 'Vary the arguments, raise maxIdenticalCalls for polling tools, or resetSession() when the task changes.',
+  },
+  {
+    gate: 'VELOCITY_EXCEEDED',
+    when: 'More than maxCallsPerMinute calls (default 30) inside the sliding window; the session is halted.',
+    why: 'A flooding agent is indistinguishable from a compromised one — halt first, investigate after.',
+    fix: 'Raise maxCallsPerMinute/windowMs for bursty workloads, or resetSession() after manual review.',
+  },
+  {
+    gate: 'BUDGET_EXCEEDED',
+    when: 'Lifetime maxTotalCalls or maxSessionTokens exhausted; the session is halted.',
+    why: 'Hard budgets bound blast radius and spend per agent session.',
+    fix: 'Raise the budgets for long-running agents, or resetSession() to start a fresh budget window.',
   },
   {
     gate: 'CAPABILITY_VIOLATION',

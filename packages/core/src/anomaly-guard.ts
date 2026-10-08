@@ -9,7 +9,8 @@
  *  - **Velocity limit** — more than `maxCallsPerMinute` calls (default 30) in a
  *    sliding `windowMs` window, a `maxTotalCalls` lifetime budget, or a
  *    `maxSessionTokens` token budget **halts the session**: every later call
- *    is refused with `LOOP_BLOCKED` instead of being re-evaluated.
+ *    is refused with `VELOCITY_EXCEEDED` / `BUDGET_EXCEEDED` instead of being
+ *    re-evaluated.
  *
  * The mission calls this "killing the process"; vark refuses to call
  * `process.exit()` because a security guard must not crash its host. Halting
@@ -44,8 +45,18 @@ export interface AnomalySessionStats {
 export interface AnomalyVerdict {
   safe: boolean;
   reason?: string;
+  /**
+   * Which check refused the call. Set on every refusal; undefined when safe.
+   * - `'loop'` → identical-call limit hit (refused, session stays open)
+   * - `'velocity'` → calls-per-minute exceeded (session halted)
+   * - `'budget'` → lifetime call or token budget exhausted (session halted)
+   */
+  cause?: AnomalyCause;
   stats: AnomalySessionStats;
 }
+
+/** Which anomaly check refused a call. */
+export type AnomalyCause = 'loop' | 'velocity' | 'budget';
 
 interface CallRecord {
   at: number;
@@ -60,6 +71,8 @@ interface SessionState {
   tokens: number;
   halted: boolean;
   haltReason: string;
+  /** Why the session was halted. Empty string while open. */
+  haltCause: AnomalyCause | '';
   calls: CallRecord[];
   identical: Map<string, number>;
 }
@@ -144,13 +157,14 @@ export class AnomalyGuard {
     const tokenCost = estimateTokens(fingerprint);
     const identicalBefore = session.identical.get(fingerprint) ?? 0;
 
-    const refuse = (reason: string, halt = false): AnomalyVerdict => {
+    const refuse = (reason: string, halt = false, cause: AnomalyCause = 'loop'): AnomalyVerdict => {
       if (halt && !session.halted) {
         session.halted = true;
         session.haltReason = reason;
+        session.haltCause = cause;
       }
       if (consume && !session.halted) this.#commit(session, fingerprint, tokenCost);
-      return { safe: false, reason, stats: this.#snapshot(session, fingerprint, identicalBefore) };
+      return { safe: false, reason, cause, stats: this.#snapshot(session, fingerprint, identicalBefore) };
     };
 
     if (!this.enabled) {
@@ -159,7 +173,8 @@ export class AnomalyGuard {
     }
 
     if (session.halted) {
-      return refuse(`session "${session.id}" is halted: ${session.haltReason}`, false);
+      const cause: AnomalyCause = session.haltCause === '' ? 'loop' : session.haltCause;
+      return refuse(`session "${session.id}" is halted: ${session.haltReason}`, false, cause);
     }
 
     const callsInWindow = this.#pruneWindow(session);
@@ -168,6 +183,7 @@ export class AnomalyGuard {
         `velocity limit exceeded: ${callsInWindow} calls in ${this.windowMs}ms ` +
           `(maxCallsPerMinute=${this.maxCallsPerMinute})`,
         true,
+        'velocity',
       );
     }
 
@@ -175,6 +191,7 @@ export class AnomalyGuard {
       return refuse(
         `session call budget exhausted: ${session.totalCalls}/${this.maxTotalCalls} calls`,
         true,
+        'budget',
       );
     }
 
@@ -182,6 +199,7 @@ export class AnomalyGuard {
       return refuse(
         `session token budget exhausted: ${session.tokens}/${this.maxSessionTokens} tokens`,
         true,
+        'budget',
       );
     }
 
@@ -190,6 +208,8 @@ export class AnomalyGuard {
         `infinite loop detected: call #${identicalBefore + 1} repeats identical tool+arguments ` +
           `(maxIdenticalCalls=${this.maxIdenticalCalls} per session, "${session.id}") ` +
           `fingerprint ${fingerprint.slice(0, 96)}`,
+        false,
+        'loop',
       );
     }
 
@@ -243,6 +263,7 @@ export class AnomalyGuard {
       tokens: 0,
       halted: false,
       haltReason: '',
+      haltCause: '',
       calls: [],
       identical: new Map(),
     };

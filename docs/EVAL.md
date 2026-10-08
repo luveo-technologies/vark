@@ -27,13 +27,13 @@ their README/docs. Judge everything black-box, by documented behavior.
 
 - Node.js ≥ 20 available (`node --version`).
 - Network access to https://registry.npmjs.org.
-- Run: `npm install @luveo-tech/vark@0.1.1` in your scratch dir.
+- Run: `npm install @luveo-tech/vark@0.1.2` in your scratch dir.
   - If this 404s, **STOP** and report "PACKAGE NOT PUBLISHED" — do not proceed.
 
 ### Phase 1 — Install & smoke test (~10 min)
 
 1. Install the library locally and the MCP bridge:
-   `npm install @luveo-tech/vark-mcp@0.1.1`.
+   `npm install @luveo-tech/vark-mcp@0.1.2`.
 2. Install the CLI globally: `npm install -g @luveo-tech/vark`, then run
    `vark --help` and `vark doctor`. Both must exit 0.
    - Also try the zero-install path: `npx -p @luveo-tech/vark vark --help`.
@@ -67,7 +67,7 @@ Then verify each row of this table and record PASS/FAIL with actual output:
 
 Also verify: `runtime.audit.summary()` shows the decisions above,
 `runtime.audit.verify()` returns `{ ok: true }`, and `read.compact`
-returns a `type read_file = (...) => any;` signature line (preceded by a `//` description comment, so `compact()` output is two lines total).
+returns a single-line `/* … */ type read_file = (...) => any;` signature.
 
 ### Phase 3 — CLI acceptance (~20 min)
 

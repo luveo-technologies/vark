@@ -213,6 +213,8 @@ export function printCheckResults(results: CheckResult[], opts: PrintCheckOption
 /** One-line remediation pointers shown under `--verbose` refusals. */
 const VERBOSE_HINTS: Record<string, string> = {
   LOOP_BLOCKED: 'vary the arguments or raise maxIdenticalCalls',
+  VELOCITY_EXCEEDED: 'session halted: raise maxCallsPerMinute or resetSession() after review',
+  BUDGET_EXCEEDED: 'session halted: raise the call/token budget or resetSession()',
   CAPABILITY_VIOLATION: 'widen the filesystem grant or network allowlist',
   CIRCUIT_BREAKER: 'pass argv arrays, never shell strings',
   DLP_REDACTED: 'rotate the credential; it never reached the tool',

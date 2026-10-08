@@ -148,6 +148,8 @@ export function histoBar(label: string, count: number, max: number, width = 12):
 /** Decision → colored chip. */
 export function decisionChip(decision: string): string {
   if (decision === 'ALLOWED') return green('ALLOWED ');
-  if (decision === 'LOOP_BLOCKED' || decision === 'TIMEOUT') return yellow(decision.padEnd(8));
+  if (decision === 'LOOP_BLOCKED' || decision === 'TIMEOUT' || decision === 'VELOCITY_EXCEEDED' || decision === 'BUDGET_EXCEEDED') {
+    return yellow(decision.padEnd(8));
+  }
   return red(decision.padEnd(8));
 }

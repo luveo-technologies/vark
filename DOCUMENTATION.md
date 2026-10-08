@@ -55,7 +55,7 @@ It sits **between the model and your tools**:
 | --- | --- |
 | **Sub-millisecond circuit breaking** | Pre-compiled regex firewall over the whole argument payload; measured **p50 0.0016 ms / p99 0.0079 ms** over 20 000 inspections (see [§7](#7-performance--benchmarks)) |
 | **8-gate zero-trust pipeline** | Anomaly guard → capability sandbox → circuit breaker → input DLP → isolated execution → output DLP → indirect-injection filter → hash-chained audit, in that exact order |
-| **60–80 % CTP token compression** | Verbose JSON Schemas become compact TypeScript signatures (a `//` description comment plus a one-line `type`): `read_file` **71.6 %**, `search_docs` **78.6 %** smaller per request |
+| **60–80 % CTP token compression** | Verbose JSON Schemas become single-line TypeScript signatures (inline description comment + `type`): `read_file` **70.7 %**, `search_docs` **78.6 %** smaller per request |
 | **Zero-rewrite Anthropic MCP adapter** | Wrap raw `{ name, description, inputSchema }` descriptors byte-identically; vark adds the guards, the `execute()` hook and the CTP signature |
 | **Never throws at the call site** | Every path — allowed, blocked, timed out, crashed — resolves to a `ToolExecutionResult` |
 | **Append-only, hash-chained audit** | `SHA-256(canonical(record + prevHash))`, optionally HMAC-signed, with `verify()` |
@@ -170,10 +170,9 @@ await read.execute({ path: '../../etc/passwd' });
 // { success: false, blockedBy: 'CAPABILITY_VIOLATION',
 //   error: 'path "../../etc/passwd" is outside the filesystem capability grants (./workspace/*)' }
 
-// CTP signature for this tool (see §5)
+// CTP signature for this tool (see §5) — one line, always
 console.log(read.compact);
-// // Read a UTF-8 file.
-// type read_file = (path: string) => any;
+// /* Read a UTF-8 file. */ type read_file = (path: string) => any;
 
 // Every decision above is in the audit trail
 console.log(runtime.audit.summary());   // { ALLOWED: 1, CAPABILITY_VIOLATION: 1 }
@@ -235,7 +234,7 @@ or lets the call through.
 
 ### Gate 1 — Anomaly Guard
 
-**File:** `anomaly-guard.ts` · **Config:** `VarkConfig.anomaly` · **Refusal:** `LOOP_BLOCKED`
+**File:** `anomaly-guard.ts` · **Config:** `VarkConfig.anomaly` · **Refusals:** `LOOP_BLOCKED` (identical-call loop) · `VELOCITY_EXCEEDED` (rate halt) · `BUDGET_EXCEEDED` (budget halt)
 
 Stateful, per-session window that stops runaway execution before anything else
 happens.
@@ -273,12 +272,11 @@ reason. Vark deliberately does **not** call `process.exit()` — a security guar
 must not crash its host; a halted session leaves you a live process and a
 readable audit trail. Clear a session with `runtime.resetSession(id)`.
 
-> **One code, three causes.** Identical-call loops, velocity breaches, and
-> budget exhaustion all surface as `blockedBy: 'LOOP_BLOCKED'` by design —
-> the anomaly guard is one gate with one refusal code. The `reason` string
-> always names the specific cause (`infinite loop detected…` vs `velocity
-> limit exceeded…` vs `budget exhausted…`), and the audit entry records it
-> verbatim, so distinguish causes by `reason`, not by `blockedBy`.
+> **One gate, three codes (since 0.1.2).** Identical-call loops,
+> velocity breaches, and budget exhaustion surface as `LOOP_BLOCKED`,
+> `VELOCITY_EXCEEDED`, and `BUDGET_EXCEEDED` respectively — 0.1.0/0.1.2
+> reported all three as `LOOP_BLOCKED`. The `reason` string always names the
+> specific cause, and the audit entry records it verbatim.
 
 **Attempt accounting.** `record()` charges *every* attempt (even refused ones),
 so an attacker cannot reset a velocity limit by making blocked calls. Input
@@ -670,6 +668,7 @@ await runtime.execute('read_file', { path: './a.json' }, { sessionId: 'agent-7' 
 ```ts
 'CIRCUIT_BREAKER' | 'CAPABILITY_VIOLATION' | 'TIMEOUT' | 'EXECUTION_ERROR'
 | 'DLP_REDACTED' | 'INDIRECT_INJECTION' | 'LOOP_BLOCKED'
+| 'VELOCITY_EXCEEDED' | 'BUDGET_EXCEEDED'
 ```
 
 `GateDecision` (audit only) additionally includes `'ALLOWED'`.
@@ -816,7 +815,7 @@ stableStringify(value);                        // canonical JSON (sorted keys, c
 | `timestamp` | `string` | ISO-8601 |
 | `sessionId` | `string` | Agent session |
 | `tool` | `string` | Tool name |
-| `decision` | `GateDecision` | `ALLOWED` · `CIRCUIT_BREAKER` · `CAPABILITY_VIOLATION` · `DLP_REDACTED` · `INDIRECT_INJECTION` · `LOOP_BLOCKED` · `TIMEOUT` · `EXECUTION_ERROR` |
+| `decision` | `GateDecision` | `ALLOWED` · `CIRCUIT_BREAKER` · `CAPABILITY_VIOLATION` · `DLP_REDACTED` · `INDIRECT_INJECTION` · `LOOP_BLOCKED` · `VELOCITY_EXCEEDED` · `BUDGET_EXCEEDED` · `TIMEOUT` · `EXECUTION_ERROR` |
 | `blockedBy` | `BlockedBy?` | Present only for refusals |
 | `reason` | `string?` | Human-readable reason (incl. injection findings) |
 | `sanitizedInputs` | `unknown` | Arguments **after input DLP** — never the raw secrets |
@@ -914,8 +913,7 @@ compressSchema('read_file', 'Read a UTF-8 text file.', {
 ```
 
 ```ts
-// Read a UTF-8 text file.
-type read_file = (path: string, limit?: number) => any;
+/* Read a UTF-8 text file. */ type read_file = (path: string, limit?: number) => any;
 ```
 
 ### Supported JSON Schema constructs
@@ -963,7 +961,7 @@ From `pnpm demo` (section 4):
 
 | Tool | Original | CTP | Saved |
 | --- | --- | --- | --- |
-| `read_file` | **116 tokens** | **33 tokens** | **71.6 %** (83 recovered per request) |
+| `read_file` | **116 tokens** | **34 tokens** | **70.7 %** (82 recovered per request) |
 | `search_docs` (nested `filters`, arrays, defaults) | **234 tokens** | **50 tokens** | **78.6 %** (184 recovered per request) |
 
 Per-request savings compound: a 40-tool agent re-sending its schema every turn
@@ -1034,8 +1032,7 @@ tools[0].check({ url: 'https://evil.example.net/steal' });
 // { safe: false, blockedBy: 'CAPABILITY_VIOLATION', reason: 'host of "…" is not in …' }
 
 console.log(tools[1].compact);
-// // Semantic search over the docs corpus.
-// type mcp__docs__search = (query: string, limit?: number) => any;
+// /* Semantic search over the docs corpus. */ type mcp__docs__search = (query: string, limit?: number) => any;
 ```
 
 Other members: `adapter.get(name)`, `adapter.list()`,
@@ -1252,7 +1249,9 @@ if (result.success) {
   switch (result.blockedBy) {
     case 'CAPABILITY_VIOLATION': grantAccess(result.error); break;  // policy gap — fix grants
     case 'CIRCUIT_BREAKER':      logAttack(result.error);   break;  // actual attack signature
-    case 'LOOP_BLOCKED':         resetSession(result.sessionId); break;
+    case 'LOOP_BLOCKED':         resetSession(result.sessionId); break;  // identical-call loop
+    case 'VELOCITY_EXCEEDED':    coolDownThenReset(result.sessionId); break;  // rate halt
+    case 'BUDGET_EXCEEDED':      raiseBudgetOrReset(result.sessionId); break;  // budget halt
     case 'TIMEOUT':              retryWithMoreBudget();     break;
     default:                     reportFailure(result.error); break;
   }
@@ -1364,7 +1363,7 @@ Not yet. It is reserved and currently behaves as `'process'` (documented in
 `types.ts`).
 
 **Is `vark` published to npm?**
-Both packages are `0.1.1` workspace packages in this monorepo, consumed via
+Both packages are `0.1.2` workspace packages in this monorepo, consumed via
 `workspace:*`. The install commands in §2 apply once published.
 
 ---

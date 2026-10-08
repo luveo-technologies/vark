@@ -1,6 +1,6 @@
 # `@luveo-tech/vark`
 
-> ⚠️ **Under active development — v0.1.1.** This library is functional but
+> ⚠️ **Under active development — v0.1.2.** This library is functional but
 > pre-release: expect bugs, sharp edges, and breaking changes between
 > versions. Do not rely on it as your sole security boundary in production
 > yet. Found something? Report it — see `SECURITY.md`.

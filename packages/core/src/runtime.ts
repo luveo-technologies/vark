@@ -19,6 +19,7 @@
  */
 
 import { AnomalyGuard } from './anomaly-guard.js';
+import type { AnomalyCause } from './anomaly-guard.js';
 import { AuditLogger, stableStringify } from './audit-logger.js';
 import { inspectPayload } from './circuit-breaker.js';
 import { analyzeCompression, estimateTokens } from './compressor.js';
@@ -46,6 +47,16 @@ import type {
   VarkConfig,
 } from './types.js';
 import { VarkError } from './types.js';
+
+/**
+ * Map an anomaly-guard refusal cause onto the public refusal code.
+ * Loops refuse just the call; velocity/budget halts refuse the session.
+ */
+function anomalyBlockedBy(cause: AnomalyCause | undefined): BlockedBy {
+  if (cause === 'velocity') return 'VELOCITY_EXCEEDED';
+  if (cause === 'budget') return 'BUDGET_EXCEEDED';
+  return 'LOOP_BLOCKED';
+}
 
 /** A tool after it has been registered and armed with vark guards. */
 export interface WrappedTool<TArgs = any, TResult = any> {
@@ -188,7 +199,8 @@ export class VarkRuntime {
 
     const anomaly = this.anomaly.check(sessionId, name, args);
     if (!anomaly.safe) {
-      return { safe: false, blockedBy: 'LOOP_BLOCKED', reason: anomaly.reason };
+      const blockedBy = anomalyBlockedBy(anomaly.cause);
+      return { safe: false, blockedBy, reason: anomaly.reason };
     }
 
     const authorised = inspectArguments(args, wrapped.capabilities);
@@ -336,7 +348,7 @@ export class VarkRuntime {
     // ── 1. Anomaly guard ────────────────────────────────────────────────
     const anomaly = this.anomaly.record(sessionId, tool, args);
     if (!anomaly.safe) {
-      return commit(refusal('LOOP_BLOCKED', anomaly.reason ?? 'anomaly guard refused the call'));
+      return commit(refusal(anomalyBlockedBy(anomaly.cause), anomaly.reason ?? 'anomaly guard refused the call'));
     }
 
     // ── 2. Capability sandbox ───────────────────────────────────────────

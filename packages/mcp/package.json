@@ -1,6 +1,6 @@
 {
   "name": "@luveo-tech/vark-mcp",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Zero-rewrite bridge that wraps Anthropic Model Context Protocol (MCP) tools with vark protection.",
   "type": "module",
   "license": "MIT",

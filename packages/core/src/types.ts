@@ -202,7 +202,9 @@ export type BlockedBy =
   | 'EXECUTION_ERROR'
   | 'DLP_REDACTED'
   | 'INDIRECT_INJECTION'
-  | 'LOOP_BLOCKED';
+  | 'LOOP_BLOCKED'
+  | 'VELOCITY_EXCEEDED'
+  | 'BUDGET_EXCEEDED';
 
 /** Terminal gate decision recorded in the audit trail. */
 export type GateDecision =
@@ -212,6 +214,8 @@ export type GateDecision =
   | 'DLP_REDACTED'
   | 'INDIRECT_INJECTION'
   | 'LOOP_BLOCKED'
+  | 'VELOCITY_EXCEEDED'
+  | 'BUDGET_EXCEEDED'
   | 'TIMEOUT'
   | 'EXECUTION_ERROR';
 

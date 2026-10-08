@@ -1,6 +1,6 @@
 # vark
 
-> ⚠️ **Under active development — v0.1.1.** This project is functional but
+> ⚠️ **Under active development — v0.1.2.** This project is functional but
 > pre-release: expect bugs, sharp edges, and breaking changes between
 > versions. Do not rely on it as your sole security boundary in production
 > yet. Found something? Report it — see `SECURITY.md`.
@@ -235,8 +235,7 @@ compressSchema('read_file', 'Read a UTF-8 text file.', {
   properties: { path: { type: 'string' }, limit: { type: 'integer' } },
   required: ['path'],
 });
-// // Read a UTF-8 text file.
-// type read_file = (path: string, limit?: number) => any;
+// /* Read a UTF-8 text file. */ type read_file = (path: string, limit?: number) => any;
 ```
 
 Supports `object` / `array` / `enum` / `const` / `oneOf` / `anyOf` / `allOf`,

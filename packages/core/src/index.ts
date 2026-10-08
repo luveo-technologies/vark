@@ -82,7 +82,7 @@ export type {
 } from './indirect-injection.js';
 
 export { AnomalyGuard, callFingerprint } from './anomaly-guard.js';
-export type { AnomalySessionStats, AnomalyVerdict } from './anomaly-guard.js';
+export type { AnomalySessionStats, AnomalyVerdict, AnomalyCause } from './anomaly-guard.js';
 
 export { AuditLogger, GENESIS_HASH, stableStringify } from './audit-logger.js';
 export type { AuditAppendInput, AuditVerifyResult } from './audit-logger.js';

@@ -10,8 +10,8 @@
  *   { "type":"object", "properties": { "query": {"type":"string"},
  *     "limit": {"type":"integer"} }, "required":["query"] }
  *                      ↓
- *   // Search the index by free text.
- *   type search = (query: string, limit?: number) => any;
+ *   a single line: an inline description comment followed by
+ *   `type search = (query: string, limit?: number) => any;`
  */
 
 export interface CompressionReport {
@@ -149,19 +149,23 @@ function buildSignature(schema: JsonSchemaLike): string {
 
 function comment(description: string): string {
   const flat = String(description ?? '').replace(/\s*\r?\n+/g, ' ').trim();
-  return flat.length > 0 ? flat : 'no description';
+  // Keep the block comment closable on one line: neutralize any `*/` in text.
+  const safe = flat.replace(/\*\//g, '* /');
+  return safe.length > 0 ? safe : 'no description';
 }
 
 /**
  * Convert a verbose JSON Schema into a compact TypeScript signature.
  *
- * The optional `returns` / `x-returns` hint customises the return type;
- * otherwise it is `any`.
+ * Single line: an inline `slash-star` description comment followed by the
+ * `type` signature, so consumers splitting on `\n` count exactly one entry
+ * per tool. The optional `returns` / `x-returns` hint customises the return
+ * type; otherwise it is `any`.
  */
 export function compressSchema(name: string, description: string, jsonSchema: object): string {
   const schema = (jsonSchema ?? {}) as JsonSchemaLike;
   const returns = resolveType(schema.returns ?? schema['x-returns']) ?? 'any';
-  return `// ${comment(description)}\ntype ${safeIdentifier(name)} = ${buildSignature(schema)} => ${returns};`;
+  return `/* ${comment(description)} */ type ${safeIdentifier(name)} = ${buildSignature(schema)} => ${returns};`;
 }
 
 /**

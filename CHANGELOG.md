@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-10-08
+
+### Added
+
+- Distinct refusal codes for anomaly halts: `VELOCITY_EXCEEDED` (rate halt)
+  and `BUDGET_EXCEEDED` (call/token budget halt). `LOOP_BLOCKED` now means
+  only the identical-call loop. `AnomalyVerdict.cause` (`'loop' |
+  'velocity' | 'budget'`) drives the mapping in both `execute()` and the
+  `check()` dry run; halted sessions keep reporting their original cause.
+
+### Changed
+
+- **BREAKING (minor):** `compact()` / `compressSchema()` emit a single line —
+  an inline `/* description */` comment followed by the `type` signature —
+  instead of a `//` comment line plus signature line. No more `\n`-split
+  double-count hazard for consumers.
+
 ## [0.1.1] - 2026-10-08
 
 ### Fixed

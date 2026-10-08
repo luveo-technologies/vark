@@ -7,6 +7,7 @@ const cells = (line) => line.split(/(?<!\\)\|/).length - 1;
 
 let block = [];
 let issues = 0;
+let inFence = false;
 
 const flush = () => {
   if (block.length >= 2) {
@@ -28,6 +29,12 @@ const flush = () => {
 };
 
 lines.forEach((line, index) => {
+  if (/^```/.test(line)) {
+    flush();
+    inFence = !inFence;
+    return;
+  }
+  if (inFence) return;
   if (/^\|/.test(line)) block.push([index, line]);
   else flush();
 });
