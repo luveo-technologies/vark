@@ -12,6 +12,12 @@
  *  - a CTP signature so the descriptor can be sent to the model in far fewer
  *    tokens than the original JSON Schema.
  *
+ * Every wrapped tool pins a SHA-256 hash of `{ name, description,
+ * inputSchema }`. The pin is enforced two ways: `check()`/`execute()`
+ * detect in-place mutation of the captured descriptor, and
+ * `reconcile()` detects a server that re-lists a *changed* descriptor
+ * (schema rug pull) — see {@link VarkMCPAdapter.reconcile}.
+ *
  * ```ts
  * const adapter = new VarkMCPAdapter({ executor: async (tool, args) => client.callTool(tool.name, args) });
  * const tools = adapter.wrapTools(mcpTools, { network: { allowedHosts: ['api.example.com'] } });
@@ -128,10 +134,34 @@ export class VarkMCPAdapter {
 
   readonly #executor?: MCPExecutor;
   readonly #tools = new Map<string, WrappedMCPTool>();
+  /** Recorded pin violations from `reconcile()` — permanent until re-wrap. */
+  readonly #violations = new Map<string, string>();
 
   constructor(options: VarkMCPAdapterOptions = {}) {
     this.runtime = options.runtime ?? new VarkRuntime(options.config ?? {});
     this.#executor = options.executor;
+  }
+
+  /** Audit a pin refusal and build the failed execution result. */
+  #refuse(entry: WrappedMCPTool, reason: string, args?: unknown, options?: ExecutionOptions): ToolExecutionResult {
+    const sessionId = options?.sessionId ?? this.runtime.session ?? DEFAULT_SESSION;
+    // Audited here because the guard pipeline is never reached.
+    this.runtime.audit.append({
+      sessionId,
+      tool: entry.name,
+      decision: 'DESCRIPTOR_PIN_VIOLATION',
+      blockedBy: 'DESCRIPTOR_PIN_VIOLATION',
+      reason,
+      sanitizedInputs: args,
+      executionTimeMs: 0,
+    });
+    return {
+      success: false,
+      blockedBy: 'DESCRIPTOR_PIN_VIOLATION',
+      error: reason,
+      executionTimeMs: 0,
+      sessionId,
+    };
   }
 
   /**
@@ -183,33 +213,19 @@ export class VarkMCPAdapter {
         compact: guard.compact,
         compression: guard.compression,
         check: (args?: unknown, options?: ExecutionOptions): GuardResult => {
+          const recorded = this.#violations.get(entry.name);
+          if (recorded) {
+            return { safe: false, blockedBy: 'DESCRIPTOR_PIN_VIOLATION', reason: recorded };
+          }
           const pin = checkDescriptorPin(entry, tool);
           if (pin) return pin;
           return this.runtime.check(tool.name, args, options);
         },
         execute: async (args?: unknown, options?: ExecutionOptions) => {
+          const recorded = this.#violations.get(entry.name);
+          if (recorded) return this.#refuse(entry, recorded, args, options);
           const pin = checkDescriptorPin(entry, tool);
-          if (pin) {
-            const sessionId = options?.sessionId ?? this.runtime.session ?? DEFAULT_SESSION;
-            const message = pin.reason ?? 'MCP descriptor changed since wrap';
-            // Audited here because the guard pipeline is never reached.
-            this.runtime.audit.append({
-              sessionId,
-              tool: tool.name,
-              decision: 'DESCRIPTOR_PIN_VIOLATION',
-              blockedBy: 'DESCRIPTOR_PIN_VIOLATION',
-              reason: message,
-              sanitizedInputs: args,
-              executionTimeMs: 0,
-            });
-            return {
-              success: false,
-              blockedBy: 'DESCRIPTOR_PIN_VIOLATION',
-              error: message,
-              executionTimeMs: 0,
-              sessionId,
-            };
-          }
+          if (pin) return this.#refuse(entry, pin.reason ?? 'MCP descriptor changed since wrap', args, options);
           return guard.execute(args, options);
         },
       };
@@ -229,15 +245,50 @@ export class VarkMCPAdapter {
     return [...this.#tools.values()];
   }
 
+  /**
+   * Verify a freshly fetched `tools/list` against the wrap-time pins.
+   *
+   * The in-place pin check inside `check()`/`execute()` only sees mutations
+   * of the descriptor object captured at wrap time; a server that returns
+   * *new* objects on its next listing (the real schema rug pull) is only
+   * visible when the host feeds that listing back in. Call `reconcile()`
+   * whenever the server re-lists (`notifications/list_changed`, reconnects,
+   * polling): any wrapped tool whose `{ name, description, inputSchema }`
+   * no longer matches its pin is **permanently refused** with
+   * `DESCRIPTOR_PIN_VIOLATION` (audited once) until `clear()` and a fresh
+   * `wrapTools()` re-establish trust.
+   *
+   * @returns descriptors that failed verification — empty array = all pinned
+   */
+  reconcile(descriptors: unknown): Array<{ name: string; reason: string }> {
+    const failures: Array<{ name: string; reason: string }> = [];
+    for (const raw of Array.isArray(descriptors) ? descriptors : []) {
+      if (!raw || typeof raw !== 'object') continue;
+      const live = raw as MCPToolLike;
+      if (typeof live.name !== 'string') continue;
+      const entry = this.#tools.get(live.name);
+      if (!entry) continue; // not wrapped through this adapter
+      if (this.#violations.has(entry.name)) continue; // already refused — audited once
+      const verdict = checkDescriptorPin(entry, live);
+      if (verdict?.reason) {
+        this.#violations.set(entry.name, verdict.reason);
+        failures.push({ name: entry.name, reason: verdict.reason });
+        this.#refuse(entry, verdict.reason, raw);
+      }
+    }
+    return failures;
+  }
+
   /** Payload-only inspection (circuit breaker) for a raw argument object. */
   inspect(args: unknown): InspectionResult {
     return this.runtime.inspect(args);
   }
 
-  /** Unwrap every tool registered through this adapter. */
+  /** Unwrap every tool registered through this adapter (also clears recorded pin violations). */
   clear(): void {
     for (const name of this.#tools.keys()) this.runtime.unregister(name);
     this.#tools.clear();
+    this.#violations.clear();
   }
 }
 
