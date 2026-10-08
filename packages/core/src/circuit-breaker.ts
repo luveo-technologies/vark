@@ -8,6 +8,7 @@
  */
 
 import type { CircuitBreakerConfig, InspectionResult } from './types.js';
+import { normalizeForScan } from './security/sanitization/normalizer.js';
 
 interface PayloadPattern {
   id: string;
@@ -97,6 +98,21 @@ export function inspectPayload(
     if (typeof value === 'string') {
       let result = testPatterns(value, shellPatterns, argName);
       if (result.safe) result = testPatterns(value, pathPatterns, argName);
+      if (result.safe) {
+        // Second pass over the canonical form: catches visual-spoofing
+        // obfuscation (zero-width chars, full-width homoglyphs, bidi
+        // controls) that the raw patterns cannot see. Pure-ASCII input
+        // short-circuits inside normalizeForScan, so clean payloads pay
+        // for one cheap regex and nothing more.
+        const canonical = normalizeForScan(value);
+        if (canonical !== value) {
+          result = testPatterns(canonical, shellPatterns, argName);
+          if (result.safe) result = testPatterns(canonical, pathPatterns, argName);
+          if (!result.safe) {
+            result = { safe: false, reason: `${result.reason} (normalized input)` };
+          }
+        }
+      }
       if (!result.safe) return result;
       return { safe: true };
     }

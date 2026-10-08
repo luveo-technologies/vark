@@ -40,15 +40,43 @@ export async function runCheck(
 
   // Create runtime with default config
   const runtime = new VarkRuntime(config);
-
-  // We need to register a generic tool that can handle any tool name
-  // Since we don't know the tools in advance, we'll use a catch-all approach
-  // by registering tools dynamically or using the check method directly
-
+  const registered = new Set<string>();
   const results: CheckResult[] = [];
 
   for (const file of files) {
-    const payload = await loadPayload(file);
+    let payload: unknown;
+    try {
+      payload = await loadPayload(file);
+    } catch (error) {
+      // A malformed file fails its own entry — the rest of the batch still runs.
+      results.push({
+        file,
+        tool: 'unknown',
+        success: false,
+        blockedBy: 'EXECUTION_ERROR',
+        reason: error instanceof Error ? error.message : String(error),
+      });
+      continue;
+    }
+    // Register a permissive stand-in for every tool name in the batch so
+    // gates 1–3 evaluate the real arguments. Stand-ins use an empty-object
+    // schema, take grants from `-c` config, and can never execute: check()
+    // is a dry run and never calls run().
+    const toolName =
+      payload !== null && typeof payload === 'object' && 'tool' in payload
+        ? (payload as { tool?: unknown }).tool
+        : undefined;
+    if (typeof toolName === 'string' && toolName.length > 0 && !registered.has(toolName)) {
+      registered.add(toolName);
+      runtime.tool({
+        name: toolName,
+        description: `Stand-in registered by vark check for ${file}.`,
+        schema: { type: 'object' },
+        run: async () => {
+          throw new Error('stand-in tool must never execute');
+        },
+      });
+    }
     const result = await runSingleCheck(runtime, file, payload);
     results.push(result);
   }

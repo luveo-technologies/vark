@@ -1,6 +1,24 @@
 # `@luveo-tech/vark`
 
+> ⚠️ **Under active development — v0.1.0.** This library is functional but
+> pre-release: expect bugs, sharp edges, and breaking changes between
+> versions. Do not rely on it as your sole security boundary in production
+> yet. Found something? Report it — see `SECURITY.md`.
+
 **Zero-trust security runtime and firewall for AI agent tool calls.**
+
+## Installation
+
+```bash
+npm install @luveo-tech/vark
+pnpm add @luveo-tech/vark
+
+# CLI on your PATH everywhere:
+npm install -g @luveo-tech/vark
+
+# ...or one-off, no install:
+npx -p @luveo-tech/vark vark --help
+```
 
 `vark` intercepts tool-call payloads *before* execution, refuses anything that
 looks like an attack, enforces capability-based access control, and compresses

@@ -85,6 +85,22 @@ export function normalizeInput(text: string, config: NormalizerConfig = {}): str
 }
 
 /**
+ * Canonicalize text for scanning: identity for pure-ASCII input (NFKC,
+ * zero-width stripping and homoglyph folding cannot change it), otherwise
+ * the full {@link normalizeInput} pipeline.
+ *
+ * Lets scanners see through visual-spoofing obfuscation (zero-width
+ * joiners, full-width lookalikes, bidi controls) without paying for
+ * normalization on clean input.
+ */
+const ASCII_ONLY = /^[\x00-\x7F]*$/;
+
+export function normalizeForScan(text: string, config: NormalizerConfig = {}): string {
+  if (ASCII_ONLY.test(text)) return text;
+  return normalizeInput(text, config);
+}
+
+/**
  * Decode HTML entities (named and numeric).
  */
 export function decodeHtmlEntities(text: string): string {

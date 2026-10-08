@@ -1,5 +1,10 @@
 # vark
 
+> ⚠️ **Under active development — v0.1.0.** This project is functional but
+> pre-release: expect bugs, sharp edges, and breaking changes between
+> versions. Do not rely on it as your sole security boundary in production
+> yet. Found something? Report it — see `SECURITY.md`.
+
 **Zero-trust security runtime and firewall for AI agent tool calls.**
 
 `vark` (`@luveo-tech/vark`) intercepts tool-call payloads *before* execution, refuses
@@ -78,11 +83,15 @@ runtime.audit.trail();   // hash-chained telemetry for every call above
 
 ## CLI
 
-The `vark` binary ships inside `@luveo-tech/vark` (`npx vark …` after install).
+The `vark` binary ships inside `@luveo-tech/vark`. Install it globally,
+use it via `npx` with no install, or run it from a local clone.
 Full reference: [`docs/CLI.md`](./docs/CLI.md).
 
 ```bash
-node packages/core/dist/cli/index.js --help
+npm install -g @luveo-tech/vark   # global install — `vark` on your PATH
+npx -p @luveo-tech/vark vark --help   # ...or one-off, no install
+
+vark doctor                      # verify the install
 
 vark check payload.json            # dry-run payloads (supports globs, --watch, -v)
 vark scan "Ignore all rules…"      # per-stage detection pipeline view

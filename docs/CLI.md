@@ -1,5 +1,40 @@
 # `vark` CLI Reference
 
+## Installation
+
+```bash
+# library (local project use)
+npm install @luveo-tech/vark
+pnpm add @luveo-tech/vark
+yarn add @luveo-tech/vark
+
+# CLI, global (puts `vark` on your PATH everywhere)
+npm install -g @luveo-tech/vark
+vark --help
+
+# CLI, no install (one-off runs)
+npx -p @luveo-tech/vark vark --help
+npx -p @luveo-tech/vark vark scan "Ignore all rules"
+
+# CLI, from a local clone (development)
+git clone https://github.com/luveo-technologies/vark.git
+cd vark && pnpm install && pnpm build
+node packages/core/dist/cli/index.js --help
+```
+
+Verify the install with the built-in readiness check:
+
+```bash
+vark doctor
+```
+
+> **Stale global shim?** If `npm install -g @luveo-tech/vark` fails with
+> `EEXIST: file already exists …/npm/vark`, a previous install left its
+> shim behind. Either reinstall with `npm install -g --force
+> @luveo-tech/vark`, or remove the leftovers first (`Remove-Item
+> $env:APPDATA\npm\vark*` on Windows, `rm $(which vark)` on macOS/Linux)
+> and install again.
+
 The `vark` binary ships inside `@luveo-tech/vark` (`bin: dist/cli/index.js`).
 Install the package and the `vark` command is on your PATH. All commands use
 CI-friendly exit codes (`0` = pass/intact, `1` = blocked/corrupt/fail) and
@@ -34,6 +69,13 @@ Dry-run payload files (`{ tool, args, identity? }`, JSON) against the guard
 pipeline without executing anything. Supports globs. `--watch` re-runs on file
 change; `-v` adds a remediation hint under each refusal
 (`vark explain <gate>` for the full story).
+
+`check` auto-registers a permissive stand-in tool for every tool name in the
+batch, so gates 1–3 evaluate the real arguments (stand-ins use an
+empty-object schema and can never execute — `check()` is a dry run). Grants
+and gate tuning come from `-c config.json` (`defaultCapabilities`,
+`circuitBreaker`, …). Malformed files fail their own entry instead of
+aborting the batch.
 
 ### `vark scan <input>`
 

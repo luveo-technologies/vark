@@ -24,18 +24,27 @@ afterEach(async () => {
 });
 
 describe('vark check', () => {
-  it('passes a payload for a registered tool', async () => {
+  it('passes a benign payload for an auto-registered tool', async () => {
     const file = await writeFixture(
       'allowed.json',
       JSON.stringify({ tool: 'read_file', args: { path: './workspace/data.json' } }),
     );
-    // runCheck with no registered tools → unknown tool → blocked
+    // runCheck registers a permissive stand-in, so gates 1–3 evaluate the args
     const results = await runCheck(file, {});
     expect(results).toHaveLength(1);
     expect(results[0]!.file).toBe(file);
-    // unknown tool fails evaluation
+    expect(results[0]!.success).toBe(true);
+  });
+
+  it('blocks a malicious payload for an auto-registered tool', async () => {
+    const file = await writeFixture(
+      'blocked.json',
+      JSON.stringify({ tool: 'run_command', args: { command: 'cat file.txt; rm -rf /' } }),
+    );
+    const results = await runCheck(file, {});
+    expect(results).toHaveLength(1);
     expect(results[0]!.success).toBe(false);
-    expect(results[0]!.blockedBy).toBe('EXECUTION_ERROR');
+    expect(results[0]!.blockedBy).toBe('CIRCUIT_BREAKER');
   });
 
   it('fails gracefully on a missing tool property', async () => {
@@ -45,9 +54,16 @@ describe('vark check', () => {
     expect(results[0]!.reason).toContain('"tool"');
   });
 
-  it('fails gracefully on invalid JSON', async () => {
-    const file = await writeFixture('invalid.json', '{ not valid json');
-    await expect(runCheck(file, {})).rejects.toThrow('Failed to parse');
+  it('records invalid JSON as a failed entry and continues the batch', async () => {
+    await writeFixture('invalid.json', '{ not valid json');
+    await writeFixture('ok.json', JSON.stringify({ tool: 't1', args: {} }));
+    const results = await runCheck(join(FIXTURE_DIR, '*.json'), {});
+    expect(results).toHaveLength(2);
+    const failed = results.find((r) => r.file.endsWith('invalid.json'))!;
+    expect(failed.success).toBe(false);
+    expect(failed.reason).toContain('Failed to parse');
+    const passed = results.find((r) => r.file.endsWith('ok.json'))!;
+    expect(passed.success).toBe(true);
   });
 
   it('throws when no files match the pattern', async () => {

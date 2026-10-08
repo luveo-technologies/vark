@@ -16,6 +16,7 @@
  */
 
 import { isPlainContainer } from './dlp.js';
+import { normalizeForScan } from './security/sanitization/normalizer.js';
 import type { IndirectInjectionConfig } from './types.js';
 
 const MAX_DEPTH = 12;
@@ -158,7 +159,10 @@ export function sanitizeIndirectInjection(
 
   const walk = (node: unknown, depth: number): unknown => {
     if (typeof node === 'string') {
-      const scan = scanIndirectInjection(node, config);
+      // Scan the canonical form so zero-width characters, bidi controls
+      // and homoglyph folding cannot hide a payload. In sanitize mode the
+      // returned text is the canonical, stripped form.
+      const scan = scanIndirectInjection(normalizeForScan(node), config);
       if (!scan.triggered) return node;
       triggered = true;
       for (const reason of scan.reasons) reasons.add(reason);
