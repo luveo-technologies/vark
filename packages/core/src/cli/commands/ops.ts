@@ -117,6 +117,18 @@ const GATE_DOCS: GateDoc[] = [
     fix: 'Approve via the HitlGate, raise hitl.timeoutMs, or remove the tool mapping.',
   },
   {
+    gate: 'ISOLATION_UNAVAILABLE',
+    when: "isolation:'wasm' was requested but isolated-vm is not installed (or its bootstrap failed) and isolationConfig.allowFallback is false.",
+    why: 'Fail-closed on dependency loss: no true isolate boundary, no execution — a silent fallback would claim isolation that does not exist.',
+    fix: 'Install isolated-vm, or set isolationConfig.allowFallback: true to accept advisory execution with the warning stated.',
+  },
+  {
+    gate: 'AUDIT_UNAVAILABLE',
+    when: 'The audit sink failed to persist a record and audit.failClosed is set.',
+    why: 'Fail-closed: actions without a durable, hash-chained record are unauditable — refuse until the trail writes again.',
+    fix: 'Restore the sink (disk space, path permissions, SIEM endpoint); this refusal record probes the sink, so the next call succeeds once writes work.',
+  },
+  {
     gate: 'EXECUTION_ERROR',
     when: 'run() threw, the tool is unknown, or schema validation failed.',
     why: 'Failures resolve — never throw — so the agent loop survives.',

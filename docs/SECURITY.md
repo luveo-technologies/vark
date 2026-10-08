@@ -105,6 +105,11 @@ hash(n) = SHA-256( stableStringify( record[n] + prevHash ) )
 - **StreamAuditSink**: Any Node writable stream
 - **MultiAuditSink**: Fan-out to multiple sinks with error isolation
 
+All sinks swallow persistence errors by default (best-effort). Constructed
+with `failClosed: true` they surface failures to the caller — pair with
+`audit.failClosed` on the runtime so an unpersistable trail refuses new
+calls (`AUDIT_UNAVAILABLE`) until a write succeeds again.
+
 ## Security Guarantees
 
 | # | Guarantee |

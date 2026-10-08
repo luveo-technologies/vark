@@ -34,10 +34,12 @@ export interface SandboxExecutionResult<T = unknown> {
 /**
  * Execute a function inside an isolated sandbox with memory ceiling enforcement.
  *
- * When `isolated-vm` is available, the function runs in a true separate V8
- * heap with a hard memory limit. When it is not available and `allowFallback`
- * is true, the function runs in-process (with a warning). When `allowFallback`
- * is false, the execution is refused.
+ * When `isolated-vm` is available the function runs in a true separate V8
+ * heap with a hard memory limit. When it is not available, execution falls
+ * back to a restricted `node:vm` context (fresh global scope, no `require` /
+ * `process`). With `allowFallback: false` any run that did **not** get the
+ * true isolate boundary is refused — including fallback runs that would
+ * otherwise have succeeded — so "no isolation, no execution" holds.
  */
 export async function executeInSandbox<TArgs extends unknown[], TResult>(
   fn: (...args: TArgs) => TResult | Promise<TResult>,
@@ -54,6 +56,21 @@ export async function executeInSandbox<TArgs extends unknown[], TResult>(
   };
 
   const result = await executeIsolated(fn, args, isolateConfig);
+  const trueIsolation = result.isolated === true;
+
+  // Fail-closed on dependency loss: a *successful* fallback is still a
+  // refusal when true isolation was demanded (isolated-vm missing or its
+  // bootstrap failed).
+  if (!trueIsolation && !allowFallback) {
+    return {
+      success: false,
+      error:
+        'Refused: true isolate boundary unavailable (isolated-vm not active) and allowFallback is false — ' +
+        `install isolated-vm to restore true isolation. Underlying result: ${result.error ?? 'fallback executed under node:vm'}`,
+      isolated: false,
+      executionTimeMs: result.executionTimeMs,
+    };
+  }
 
   if (!result.success && !allowFallback) {
     return {
@@ -68,7 +85,8 @@ export async function executeInSandbox<TArgs extends unknown[], TResult>(
     success: result.success,
     data: result.data,
     error: result.error,
-    isolated: true,
+    // Honest label: false when the node:vm fallback boundary ran.
+    isolated: trueIsolation,
     peakMemoryBytes: result.peakMemoryBytes,
     executionTimeMs: result.executionTimeMs,
   };

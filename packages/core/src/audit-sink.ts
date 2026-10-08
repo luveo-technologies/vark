@@ -9,8 +9,11 @@
  *   - `StreamAuditSink` — any writable stream (stdout, gRPC, webhook)
  *   - `MultiAuditSink`  — fan-out to several sinks with error isolation
  *
- * Sinks are best-effort: a failing sink never breaks the guard pipeline.
- * Errors are reported through the optional `onError` callback.
+ * Sinks are best-effort by default: a failing sink never breaks the guard
+ * pipeline. Errors are reported through the optional `onError` callback.
+ * Constructed with `failClosed: true`, a sink surfaces persistence failures
+ * to its caller instead — pair with `audit.failClosed` on the runtime for
+ * refuse-until-the-trail-is-durable behaviour.
  */
 
 import { appendFile, mkdir } from 'node:fs/promises';
@@ -31,6 +34,14 @@ export interface AuditSink {
 export interface AuditSinkOptions {
   /** Called when a sink fails. Defaults to swallowing the error. */
   onError?: (error: Error, sinkName: string) => void;
+  /**
+   * Surface persistence failures to the caller instead of swallowing them
+   * (pair with `audit.failClosed` on the runtime for refuse-until-durable
+   * behaviour). The async file sink throws the *previous* failure on the
+   * next `write()` while re-attempting the current entry, so a recovered
+   * disk restores service automatically.
+   */
+  failClosed?: boolean;
 }
 
 /**
@@ -42,12 +53,16 @@ export class FileAuditSink implements AuditSink {
   readonly name = 'file';
   readonly #path: string;
   readonly #onError: NonNullable<AuditSinkOptions['onError']>;
+  readonly #failClosed: boolean;
   #queue: Promise<void> = Promise.resolve();
   #closed = false;
+  #failed = false;
+  #lastError?: Error;
 
   constructor(path: string, options: AuditSinkOptions = {}) {
     this.#path = path;
     this.#onError = options.onError ?? (() => undefined);
+    this.#failClosed = options.failClosed ?? false;
   }
 
   get filePath(): string {
@@ -56,6 +71,20 @@ export class FileAuditSink implements AuditSink {
 
   write(entry: AuditEntry): void {
     if (this.#closed) return;
+    if (this.#failClosed && this.#failed) {
+      const previous = this.#lastError;
+      this.#failed = false;
+      this.#lastError = undefined;
+      // Enqueue the current entry first — it doubles as the probe (a
+      // successful append keeps us healthy, a failure re-arms) — then
+      // surface the previous failure so the caller can refuse this call.
+      this.#enqueue(entry);
+      throw previous ?? new Error(`${this.name} sink write failed`);
+    }
+    this.#enqueue(entry);
+  }
+
+  #enqueue(entry: AuditEntry): void {
     const line = `${JSON.stringify(entry)}\n`;
     this.#queue = this.#queue
       .then(async () => {
@@ -63,7 +92,10 @@ export class FileAuditSink implements AuditSink {
         await appendFile(this.#path, line, 'utf8');
       })
       .catch((error: unknown) => {
-        this.#onError(error instanceof Error ? error : new Error(String(error)), this.name);
+        const err = error instanceof Error ? error : new Error(String(error));
+        this.#failed = true;
+        this.#lastError = err;
+        this.#onError(err, this.name);
       });
   }
 
@@ -86,11 +118,13 @@ export class StreamAuditSink implements AuditSink {
   readonly name = 'stream';
   readonly #stream: NodeJS.WritableStream;
   readonly #onError: NonNullable<AuditSinkOptions['onError']>;
+  readonly #failClosed: boolean;
   #closed = false;
 
   constructor(stream: NodeJS.WritableStream, options: AuditSinkOptions = {}) {
     this.#stream = stream;
     this.#onError = options.onError ?? (() => undefined);
+    this.#failClosed = options.failClosed ?? false;
   }
 
   write(entry: AuditEntry): void {
@@ -98,7 +132,9 @@ export class StreamAuditSink implements AuditSink {
     try {
       this.#stream.write(`${JSON.stringify(entry)}\n`);
     } catch (error) {
-      this.#onError(error instanceof Error ? error : new Error(String(error)), this.name);
+      const err = error instanceof Error ? error : new Error(String(error));
+      this.#onError(err, this.name);
+      if (this.#failClosed) throw err;
     }
   }
 
@@ -123,20 +159,29 @@ export class MultiAuditSink implements AuditSink {
   readonly name = 'multi';
   readonly #sinks: AuditSink[];
   readonly #onError: NonNullable<AuditSinkOptions['onError']>;
+  readonly #failClosed: boolean;
 
   constructor(sinks: AuditSink[], options: AuditSinkOptions = {}) {
     this.#sinks = sinks;
     this.#onError = options.onError ?? (() => undefined);
+    this.#failClosed = options.failClosed ?? false;
   }
 
   write(entry: AuditEntry): void {
+    let firstError: Error | undefined;
     for (const sink of this.#sinks) {
       try {
         sink.write(entry);
       } catch (error) {
-        this.#onError(error instanceof Error ? error : new Error(String(error)), sink.name);
+        const err = error instanceof Error ? error : new Error(String(error));
+        this.#onError(err, sink.name);
+        firstError ??= err;
       }
     }
+    // Fan-out isolation still holds for persistence (every sink was given
+    // the entry); with failClosed the caller learns that at least one
+    // destination is broken.
+    if (this.#failClosed && firstError) throw firstError;
   }
 
   async flush(): Promise<void> {

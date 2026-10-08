@@ -198,6 +198,8 @@ const ALERTABLE: ReadonlySet<string> = new Set([
   'HITL_DENIED',
   'LOOP_BLOCKED',
   'TIMEOUT',
+  'ISOLATION_UNAVAILABLE',
+  'AUDIT_UNAVAILABLE',
 ]);
 
 /** Whether an entry deserves an alert line (refusal of a security gate). */

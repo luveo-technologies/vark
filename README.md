@@ -164,7 +164,7 @@ interface ToolExecutionResult<T> {
   blockedBy?: 'CIRCUIT_BREAKER' | 'CAPABILITY_VIOLATION' | 'TIMEOUT' | 'EXECUTION_ERROR'
            | 'DLP_REDACTED' | 'INDIRECT_INJECTION' | 'LOOP_BLOCKED'
            | 'VELOCITY_EXCEEDED' | 'BUDGET_EXCEEDED' | 'DESCRIPTOR_PIN_VIOLATION'
-           | 'SESSION_FROZEN' | 'HITL_DENIED';
+           | 'SESSION_FROZEN' | 'HITL_DENIED' | 'ISOLATION_UNAVAILABLE' | 'AUDIT_UNAVAILABLE';
   executionTimeMs: number;
   sessionId?: string;             // agent session that produced the call
   inputRedactions?: number;       // secrets stripped before run()
@@ -248,7 +248,8 @@ Each record carries `seq`, ISO timestamp, session, tool, `decision`
 (`ALLOWED` · `CIRCUIT_BREAKER` · `CAPABILITY_VIOLATION` · `DLP_REDACTED` ·
 `INDIRECT_INJECTION` · `LOOP_BLOCKED` · `VELOCITY_EXCEEDED` ·
 `BUDGET_EXCEEDED` · `DESCRIPTOR_PIN_VIOLATION` · `SESSION_FROZEN` ·
-`HITL_DENIED` · `TIMEOUT` · `EXECUTION_ERROR`),
+`HITL_DENIED` · `ISOLATION_UNAVAILABLE` · `AUDIT_UNAVAILABLE` · `TIMEOUT` ·
+`EXECUTION_ERROR`),
 sanitised inputs, redaction counters, `executionTimeMs`, `inspectionMs`
 (circuit-breaker latency), CTP `tokensSaved` and `prevHash`/`hash`.
 

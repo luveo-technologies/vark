@@ -33,6 +33,13 @@ export interface IsolateResult<T = unknown> {
   peakMemoryBytes?: number;
   /** Wall-clock execution time in ms. */
   executionTimeMs: number;
+  /**
+   * Whether the true isolated-vm boundary was used. `false` means the
+   * restricted `node:vm` fallback ran instead (isolated-vm missing or its
+   * bootstrap failed) — callers enforcing `allowFallback: false` must treat
+   * this as a refusal, never as isolation.
+   */
+  isolated?: boolean;
 }
 
 /**
@@ -109,12 +116,14 @@ async function executeWithIsolatedVm<TArgs extends unknown[], TResult>(
       success: true,
       data,
       executionTimeMs: performance.now() - opts.startedAt,
+      isolated: true,
     };
   } catch (error) {
     return {
       success: false,
       error: error instanceof Error ? error.message : String(error),
       executionTimeMs: performance.now() - opts.startedAt,
+      isolated: true,
     };
   } finally {
     isolate.dispose();
@@ -160,12 +169,14 @@ async function executeWithNodeVm<TArgs extends unknown[], TResult>(
       success: true,
       data,
       executionTimeMs: performance.now() - opts.startedAt,
+      isolated: false,
     };
   } catch (error) {
     return {
       success: false,
       error: error instanceof Error ? error.message : String(error),
       executionTimeMs: performance.now() - opts.startedAt,
+      isolated: false,
     };
   }
 }
@@ -189,22 +200,37 @@ export async function isTrueIsolationAvailable(): Promise<boolean> {
  * The fallback is never silent: when true isolation is requested but
  * unavailable, `warning` explains exactly what the caller gets instead, so
  * operators cannot mistake advisory in-process execution for a real boundary.
+ * When the caller sets `allowFallback: false` (fail-closed), an unavailable
+ * isolate produces `refusal` instead — the consumer must refuse to execute
+ * rather than degrade.
+ *
+ * `isAvailable` exists for deterministic tests; production callers omit it.
  */
 export async function resolveIsolationMode(
   requested: IsolationMode,
-): Promise<{ mode: IsolationMode; trueIsolation: boolean; warning?: string }> {
+  opts: { allowFallback?: boolean; isAvailable?: () => Promise<boolean> } = {},
+): Promise<{ mode: IsolationMode; trueIsolation: boolean; warning?: string; refusal?: string }> {
   if (requested === 'wasm') {
-    const available = await isTrueIsolationAvailable();
-    return available
-      ? { mode: 'wasm', trueIsolation: true }
-      : {
-          mode: 'process',
-          trueIsolation: false,
-          warning:
-            "isolation:'wasm' requested but isolated-vm is not installed — " +
-            'falling back to advisory in-process execution (no memory ceiling, ' +
-            'shared heap). Install isolated-vm or set isolationConfig.allowFallback: false to refuse instead.',
-        };
+    const available = await (opts.isAvailable ?? isTrueIsolationAvailable)();
+    if (available) return { mode: 'wasm', trueIsolation: true };
+    if (opts.allowFallback === false) {
+      return {
+        mode: 'process',
+        trueIsolation: false,
+        refusal:
+          "isolation:'wasm' requested but isolated-vm is not installed and isolation.allowFallback is false — " +
+          'refusing to execute without a true isolate boundary. Install isolated-vm or set ' +
+          'isolationConfig.allowFallback: true to accept advisory execution instead.',
+      };
+    }
+    return {
+      mode: 'process',
+      trueIsolation: false,
+      warning:
+        "isolation:'wasm' requested but isolated-vm is not installed — " +
+        'falling back to advisory in-process execution (no memory ceiling, ' +
+        'shared heap). Install isolated-vm or set isolationConfig.allowFallback: false to refuse instead.',
+    };
   }
   return { mode: requested, trueIsolation: false };
 }

@@ -24,8 +24,15 @@ describe('Feature 1 — Isolated Sandbox', () => {
 
   it('respects allowFallback=false', async () => {
     const result = await executeInSandbox(() => 42, [], { allowFallback: false });
-    // Should still work since isolated-vm may or may not be available
-    expect(typeof result.success).toBe('boolean');
+    if (result.success) {
+      // It ran — therefore the TRUE isolate boundary was used, never a
+      // silent node:vm fallback mislabelled as isolation.
+      expect(result.isolated).toBe(true);
+    } else {
+      // Otherwise it refused because the boundary was unavailable.
+      expect(result.error).toContain('allowFallback is false');
+      expect(result.isolated).toBe(false);
+    }
   });
 });
 

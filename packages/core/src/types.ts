@@ -132,6 +132,14 @@ export interface AuditLoggerConfig {
   maxEntries?: number;
   /** Called with every appended entry (persist / ship to a SIEM). */
   sink?: (entry: AuditEntry) => void;
+  /**
+   * Fail closed when the trail cannot be persisted: a sink that throws marks
+   * the logger `degraded`, and while degraded the runtime refuses new calls
+   * with `AUDIT_UNAVAILABLE` before gate 1 — no execution without a durable
+   * record. The refusal record itself probes the sink, so one successful
+   * write restores service automatically. Default false (best-effort).
+   */
+  failClosed?: boolean;
   /** @default true */
   enabled?: boolean;
 }
@@ -263,7 +271,9 @@ export type BlockedBy =
   | 'BUDGET_EXCEEDED'
   | 'DESCRIPTOR_PIN_VIOLATION'
   | 'SESSION_FROZEN'
-  | 'HITL_DENIED';
+  | 'HITL_DENIED'
+  | 'ISOLATION_UNAVAILABLE'
+  | 'AUDIT_UNAVAILABLE';
 
 /** Terminal gate decision recorded in the audit trail. */
 export type GateDecision =
@@ -278,6 +288,8 @@ export type GateDecision =
   | 'DESCRIPTOR_PIN_VIOLATION'
   | 'SESSION_FROZEN'
   | 'HITL_DENIED'
+  | 'ISOLATION_UNAVAILABLE'
+  | 'AUDIT_UNAVAILABLE'
   | 'TIMEOUT'
   | 'EXECUTION_ERROR';
 

@@ -737,6 +737,7 @@ await runtime.execute('read_file', { path: './a.json' }, { sessionId: 'agent-7' 
 | 'DLP_REDACTED' | 'INDIRECT_INJECTION' | 'LOOP_BLOCKED'
 | 'VELOCITY_EXCEEDED' | 'BUDGET_EXCEEDED'
 | 'DESCRIPTOR_PIN_VIOLATION' | 'SESSION_FROZEN' | 'HITL_DENIED'
+| 'ISOLATION_UNAVAILABLE' | 'AUDIT_UNAVAILABLE'
 ```
 
 `GateDecision` (audit only) additionally includes `'ALLOWED'`.
@@ -885,7 +886,7 @@ stableStringify(value);                        // canonical JSON (sorted keys, c
 | `timestamp` | `string` | ISO-8601 |
 | `sessionId` | `string` | Agent session |
 | `tool` | `string` | Tool name |
-| `decision` | `GateDecision` | `ALLOWED` · `CIRCUIT_BREAKER` · `CAPABILITY_VIOLATION` · `DLP_REDACTED` · `INDIRECT_INJECTION` · `LOOP_BLOCKED` · `VELOCITY_EXCEEDED` · `BUDGET_EXCEEDED` · `DESCRIPTOR_PIN_VIOLATION` · `SESSION_FROZEN` · `HITL_DENIED` · `TIMEOUT` · `EXECUTION_ERROR` |
+| `decision` | `GateDecision` | `ALLOWED` · `CIRCUIT_BREAKER` · `CAPABILITY_VIOLATION` · `DLP_REDACTED` · `INDIRECT_INJECTION` · `LOOP_BLOCKED` · `VELOCITY_EXCEEDED` · `BUDGET_EXCEEDED` · `DESCRIPTOR_PIN_VIOLATION` · `SESSION_FROZEN` · `HITL_DENIED` · `ISOLATION_UNAVAILABLE` · `AUDIT_UNAVAILABLE` · `TIMEOUT` · `EXECUTION_ERROR` |
 | `blockedBy` | `BlockedBy?` | Present only for refusals |
 | `reason` | `string?` | Human-readable reason (incl. injection findings) |
 | `sanitizedInputs` | `unknown` | Arguments **after input DLP** — never the raw secrets |
@@ -1437,6 +1438,17 @@ session counters.
 | G6 | **Authorisation is re-checked at the point of use** inside `ctx.sandbox`, not only pre-flight. |
 | G7 | **The guard never crashes the host** — no `process.exit()`, no unhandled rejections (losing promises are observed). |
 | G8 | **Deterministic limits.** Timeouts, path globs, host allowlists and loop counters are enforced by code, not by model cooperation. |
+| G9 | **No silent security degradation on dependency loss.** When a security dependency disappears, vark either states exactly what changed (warning) or refuses — per configuration — never pretending the protection is still there. |
+
+### Dependency-loss behaviour (fail-closed)
+
+| Dependency | Detection | Default behaviour | Fail-closed option |
+| --- | --- | --- | --- |
+| `isolated-vm` (optional native module) | first `execute()` under `isolation: 'wasm'` | warn once; gate 5 runs in-process (by design — closures need module scope) | `isolationConfig.allowFallback: false` → every call refused with `ISOLATION_UNAVAILABLE` until the module is installed |
+| audit sink (`audit.sink`) | sink callback throws | trail flagged `degraded`, calls continue (best-effort) | `audit.failClosed: true` → calls refused **before gate 1** with `AUDIT_UNAVAILABLE`; the refusal record probes the sink, so one successful write restores service automatically |
+
+`vark explain ISOLATION_UNAVAILABLE` / `vark explain AUDIT_UNAVAILABLE`
+print the same semantics with remediation steps.
 
 ### What vark protects against
 
@@ -1452,11 +1464,16 @@ session counters.
 
 ### What vark does **not** do
 
-- It is **not** a sandbox for hostile native code: tool bodies run in-process
-  (`isolation: 'process'`); `'wasm'` isolates are not implemented yet.
+- It is **not** a sandbox for hostile native code: gate-5 `run()` bodies always
+  execute in-process (closures need module scope and `ctx.sandbox` carries live
+  functions). The standalone APIs (`executeInSandbox()`, `executeIsolated()`)
+  run self-contained functions inside a true isolated-vm heap when the
+  optional module is installed, falling back to a restricted `node:vm`
+  context otherwise — and with `allowFallback: false` they refuse instead.
 - It is **not** a semantic shell parser — gate 3 is signature-based (see §4.5).
-- It does **not** validate arguments against the JSON Schema (schema is used
-  for CTP, not runtime validation).
+- Schema validation covers structure, not semantics: arguments are validated
+  against the tool JSON Schema (`schema.validateArgs`, default on) — it does
+  not know that a syntactically valid path is a dangerous one (that is gate 3).
 - It does **not** make an *authorised* call safe: a tool that may write
   `./workspace/*` can still destroy everything inside that grant.
 - It does **not** persist audit records itself — use `audit.sink`.

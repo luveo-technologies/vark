@@ -291,5 +291,7 @@ const VERBOSE_HINTS: Record<string, string> = {
   DESCRIPTOR_PIN_VIOLATION: 're-wrap tools to accept the new descriptor, or investigate the server',
   SESSION_FROZEN: 'review the audit trail, then resetSession() to unfreeze',
   HITL_DENIED: 'approve via the HitlGate or raise hitl.timeoutMs',
+  ISOLATION_UNAVAILABLE: 'install isolated-vm, or set isolationConfig.allowFallback: true to accept advisory execution',
+  AUDIT_UNAVAILABLE: 'restore the audit sink (disk/endpoint); the trail refused until writes succeed',
   EXECUTION_ERROR: 'compare args against the tool schema',
 };

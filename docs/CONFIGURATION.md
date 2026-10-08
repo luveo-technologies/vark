@@ -91,6 +91,7 @@ interface VarkConfig {
     hmacKey?: string | Uint8Array;
     maxEntries?: number;            // default: 10_000
     sink?: (entry: AuditEntry) => void;
+    failClosed?: boolean;           // refuse calls while the sink is failing
     enabled?: boolean;              // default: true
   };
 
@@ -127,9 +128,16 @@ interface AuditLoggerConfig {
   hmacKey?: string | Uint8Array;  // HMAC-SHA256 key for tamper resistance
   maxEntries?: number;            // Ring-buffer cap, default: 10_000
   sink?: (entry: AuditEntry) => void;  // Called on every append
+  failClosed?: boolean;           // default: false — refuse calls while the
+                                  // sink is failing (AUDIT_UNAVAILABLE)
   enabled?: boolean;              // default: true
 }
 ```
+
+With `failClosed: true`, a sink that throws marks the trail `degraded` and
+every subsequent call is refused **before gate 1** — no execution without a
+durable record. The refusal record's own append probes the sink, so the next
+call proceeds automatically once a write succeeds again.
 
 ## AnomalyGuardConfig
 
@@ -196,6 +204,13 @@ interface IsolationConfig {
 > configured with `'wasm'` it warns **once** at the first `execute()`
 > stating exactly this, and `resolveIsolationMode()` reports any fallback
 > from true isolation. Nothing degrades silently.
+>
+> With `allowFallback: false` the fallback becomes a **refusal**: while
+> `isolated-vm` is unavailable, every `execute()` returns
+> `blockedBy: 'ISOLATION_UNAVAILABLE'` (fail-closed on dependency loss), and
+> `executeInSandbox(..., { allowFallback: false })` refuses any run that did
+> not get the true isolate boundary — even a fallback run that would
+> otherwise have succeeded.
 
 ## QuotaConfig
 

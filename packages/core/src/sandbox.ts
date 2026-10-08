@@ -356,7 +356,9 @@ export async function withTimeout<T>(task: () => Promise<T>, maxExecutionMs: num
     ? maxExecutionMs
     : DEFAULT_MAX_EXECUTION_MS;
 
-  const started = task();
+  // Normalise to a promise: sync run() bodies return a value, not a
+  // promise, and the race + late-rejection guard below need one either way.
+  const started = Promise.resolve().then(task);
   // If the timeout wins the race the task must still be observed, otherwise a
   // late rejection would surface as an unhandled promise rejection.
   started.catch(() => undefined);

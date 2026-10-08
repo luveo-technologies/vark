@@ -43,6 +43,7 @@ import type {
   HitlRuntimeConfig,
   IndirectInjectionConfig,
   InspectionResult,
+  IsolationConfig,
   IsolationMode,
   SchemaValidationConfig,
   ToolDefinition,
@@ -80,6 +81,7 @@ export interface WrappedTool<TArgs = any, TResult = any> {
 /** Fully resolved runtime configuration. */
 export interface ResolvedVarkConfig {
   isolation: IsolationMode;
+  isolationConfig?: IsolationConfig;
   circuitBreaker: CircuitBreakerConfig;
   defaultCapabilities: CapabilityConfig;
   dlp: DlpConfig;
@@ -101,6 +103,8 @@ export class VarkRuntime {
 
   #session: string;
   #isolationWarned = false;
+  /** Resolved once per runtime: availability of the isolate boundary + refusal (fail-closed). */
+  #isolationResolution?: Awaited<ReturnType<typeof resolveIsolationMode>>;
   readonly #tools = new Map<string, WrappedTool>();
 
   constructor(config: VarkConfig = {}) {
@@ -108,6 +112,7 @@ export class VarkRuntime {
     const cfg = applyEnvOverrides(config);
     this.config = {
       isolation: cfg.isolation ?? 'process',
+      ...(cfg.isolationConfig ? { isolationConfig: cfg.isolationConfig } : {}),
       circuitBreaker: cfg.circuitBreaker ?? {},
       defaultCapabilities: cfg.defaultCapabilities ?? {},
       dlp: cfg.dlp ?? {},
@@ -369,6 +374,20 @@ export class VarkRuntime {
       return result;
     };
 
+    // ── 0. Audit durability (fail-closed) ─────────────────────────────
+    // When the trail is known to be unpersistable and audit.failClosed is
+    // on, refuse BEFORE gate 1 — no execution without a durable record.
+    // The refusal's own append probes the sink: one successful write clears
+    // `degraded` and the next call proceeds, so recovery is automatic.
+    if (this.config.audit?.failClosed && this.audit.degraded) {
+      const message =
+        'audit sink is in a failed state and audit.failClosed is set — refusing before execution; ' +
+        'this refusal record probes the sink, so the next call proceeds once a write succeeds again';
+      flag('AUDIT_UNAVAILABLE');
+      note(message);
+      return commit(refusal('AUDIT_UNAVAILABLE', message));
+    }
+
     // ── 1. Anomaly guard ────────────────────────────────────────────────
     const anomaly = this.anomaly.record(sessionId, tool, args);
     if (!anomaly.safe) {
@@ -426,17 +445,27 @@ export class VarkRuntime {
 
     // ── 5. Execution ────────────────────────────────────────────────────
     // Never silently claim isolation we don't provide: the first execute()
-    // under isolation:'wasm' resolves availability once and states exactly
-    // what gate 5 does (in-process + capability sandbox + wall-clock timeout)
-    // and where true isolate execution lives.
-    if (this.config.isolation === 'wasm' && !this.#isolationWarned) {
-      this.#isolationWarned = true;
-      const resolved = await resolveIsolationMode('wasm');
-      console.warn(
-        `vark: ${resolved.warning ??
-          "isolation:'wasm' — gate 5 runs tool bodies in-process (closures need module scope); " +
-          'use executeInSandbox()/executeIsolated() for true isolate execution of self-contained tools.'}`,
-      );
+    // under isolation:'wasm' resolves availability once. With fallback
+    // allowed, a warning states exactly what gate 5 does; with
+    // isolationConfig.allowFallback: false the unavailable isolate refuses
+    // every call (fail-closed on dependency loss) instead of degrading.
+    if (this.config.isolation === 'wasm') {
+      this.#isolationResolution ??= await resolveIsolationMode('wasm', {
+        allowFallback: this.config.isolationConfig?.allowFallback,
+      });
+      if (this.#isolationResolution.refusal) {
+        flag('ISOLATION_UNAVAILABLE');
+        note(this.#isolationResolution.refusal);
+        return commit(refusal('ISOLATION_UNAVAILABLE', this.#isolationResolution.refusal));
+      }
+      if (!this.#isolationWarned) {
+        this.#isolationWarned = true;
+        console.warn(
+          `vark: ${this.#isolationResolution.warning ??
+            "isolation:'wasm' — gate 5 runs tool bodies in-process (closures need module scope); " +
+            'use executeInSandbox()/executeIsolated() for true isolate execution of self-contained tools.'}`,
+        );
+      }
     }
 
     // ── 4b. Human-in-the-loop approval (only for mapped high-risk tools) ──

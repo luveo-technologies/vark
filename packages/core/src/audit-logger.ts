@@ -94,9 +94,20 @@ export class AuditLogger {
   #entries: AuditEntry[] = [];
   #seq = 0;
   #prevHash = GENESIS_HASH;
+  #degraded = false;
 
   constructor(config: AuditLoggerConfig = {}) {
     this.#config = config;
+  }
+
+  /**
+   * True when the most recent sink invocation threw. Paired with
+   * `audit.failClosed`, the runtime refuses new calls while this is set;
+   * the next successful sink write (typically the refusal record's own
+   * append) clears it, so recovery is automatic once the sink works again.
+   */
+  get degraded(): boolean {
+    return this.#degraded;
   }
 
   /** Append one record. Returns `undefined` when auditing is disabled. */
@@ -130,7 +141,16 @@ export class AuditLogger {
     this.#prevHash = hash;
     this.#entries.push(entry);
     this.#trim();
-    this.#config.sink?.(entry);
+    // A throwing sink never crashes the pipeline — the entry is already in
+    // the hash chain — but it marks the trail degraded. Sinks that declare
+    // "must never throw" hold; contract violations and fail-closed sinks
+    // surface here instead of escaping append().
+    try {
+      this.#config.sink?.(entry);
+      this.#degraded = false;
+    } catch {
+      this.#degraded = true;
+    }
 
     return entry;
   }
