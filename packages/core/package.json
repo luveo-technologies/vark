@@ -1,6 +1,6 @@
 {
   "name": "@luveo-tech/vark",
-  "version": "0.2.0",
+  "version": "0.2.0-beta.1",
   "description": "Zero-trust security runtime & firewall for AI agent tool calls — 8-gate pipeline (circuit breaker, DLP, prompt-injection filter, sandbox, audit chain) for LLM tools.",
   "keywords": [
     "vark",

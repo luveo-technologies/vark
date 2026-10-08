@@ -1477,7 +1477,8 @@ this. Nothing degrades silently.
 
 **Is `vark` published to npm?**
 Yes — `@luveo-tech/vark` and `@luveo-tech/vark-mcp` are on npm (0.1.0 /
-0.1.1 published; this release is 0.2.0). Inside this monorepo the packages
+0.1.1 published; this release is `0.2.0-beta.1`, a prerelease of the 0.2.0
+line pending evaluation sign-off). Inside this monorepo the packages
 are consumed via `workspace:*`.
 
 ---
