@@ -19,12 +19,18 @@ export interface CapabilityConfig {
   };
   /**
    * Outbound network grants.
-   * - `undefined` | `true`  → unrestricted
+   * - `undefined` | `true`  → unrestricted (baseline SSRF guard still applies)
    * - `false`               → deny every outbound request
    * - `{ allowedHosts }`    → deny anything outside the host list (`*.example.com` wildcards OK)
+   *
+   * `ctx.sandbox.fetch` always refuses cloud-metadata endpoints, embedded
+   * credentials, and non-http(s) schemes; loopback/RFC1918/link-local
+   * targets are refused too unless `allowPrivate` is set (local-dev APIs).
    */
   network?: boolean | {
     allowedHosts?: string[];
+    /** Permit loopback / private-range egress (dev APIs). @default false */
+    allowPrivate?: boolean;
   };
   /** Hard wall-clock budget for `run()`. Defaults to 10 000 ms. */
   maxExecutionMs?: number;
@@ -44,6 +50,20 @@ export interface CircuitBreakerConfig {
    * Return a `string`            → value is blocked, string becomes the reason.
    */
   customRules?: Array<(argName: string, value: unknown) => boolean | string>;
+  /**
+   * Maximum recursive decode depth used when detecting encoded payloads
+   * (percent, HTML entities, hex, base64 — nested). Raise it to catch
+   * deeper nesting; lower it to bound decode work. @default 5
+   */
+  maxDecodeDepth?: number;
+  /**
+   * Refuse any argument string that decodes from an explicit encoding
+   * instead of scanning the decoded forms — for deployments that must never
+   * accept encoded input at all. Off by default (the strict decoder's
+   * marker + printability admission already keeps opaque tokens safe).
+   * @default false
+   */
+  strictDecode?: boolean;
 }
 
 /** Output/input Data-Leak-Prevention (secret redaction) policy. */

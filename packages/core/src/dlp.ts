@@ -13,6 +13,7 @@
  */
 
 import type { DlpConfig } from './types.js';
+import { decodeEncodedLayers } from './security/sanitization/normalizer.js';
 
 /** Maximum nesting depth walked in argument / output values. */
 const MAX_DEPTH = 12;
@@ -209,7 +210,26 @@ export function redactValue(value: unknown, config?: DlpConfig): DlpValueResult 
 
   const walk = (node: unknown, depth: number): unknown => {
     if (typeof node === 'string') {
-      const scan = redactText(node, config);
+      let scan = redactText(node, config);
+      if (scan.redacted === 0) {
+        // Parity with `vark scan`: a secret hidden behind an encoding is
+        // still a secret. Scan strict-decoded variants (marker-gated, so
+        // opaque tokens never qualify); a hit means the whole string is an
+        // exfil carrier — replace it wholesale, since the encoded form is
+        // the secret itself.
+        for (const variant of decodeEncodedLayers(node)) {
+          const hidden = redactText(variant.text, config);
+          if (hidden.redacted > 0) {
+            scan = {
+              text: `[REDACTED_SECRET: ${hidden.types.join(', ')}]`,
+              redacted: hidden.redacted,
+              types: hidden.types,
+              matches: hidden.matches,
+            };
+            break;
+          }
+        }
+      }
       redacted += scan.redacted;
       for (const type of scan.types) types.add(type);
       return scan.text;

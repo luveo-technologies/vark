@@ -114,11 +114,24 @@ export function inspectPayload(
       }
       if (result.safe) {
         // Third pass over strictly-decoded variants: catches smuggled
-        // encodings (percent-encoding, HTML entities, hex, base64, nested).
-        // Only strings with explicit encoding markers are decoded, and only
-        // text-like results are scanned — opaque tokens (hashes, UUIDs,
-        // session IDs) can never trip this pass.
-        for (const variant of decodeEncodedLayers(canonical)) {
+        // encodings (percent-encoding, HTML entities, hex, base64, nested,
+        // and payloads hidden inside markup wrappers). Only strings with
+        // explicit encoding markers are decoded, and only text-like results
+        // are scanned — opaque tokens (hashes, UUIDs, session IDs) can never
+        // trip this pass.
+        const variants = decodeEncodedLayers(canonical, {
+          maxDecodeDepth: config?.maxDecodeDepth,
+        });
+        if (config?.strictDecode === true && variants.length > 0) {
+          result = {
+            safe: false,
+            reason:
+              `payload rejected in "${argName}": encodable input ` +
+              `(decodes via ${variants[0]?.via.join('→') ?? 'unknown'}) — strictDecode refuses encoded arguments`,
+          };
+        }
+        for (const variant of variants) {
+          if (!result.safe) break;
           result = testPatterns(variant.text, shellPatterns, argName);
           if (result.safe) result = testPatterns(variant.text, pathPatterns, argName);
           if (!result.safe) {

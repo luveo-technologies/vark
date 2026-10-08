@@ -254,6 +254,13 @@ interface StrictDecoder {
   /** Cheap marker test: does the input even look like this encoding? */
   looksEncoded(value: string): boolean;
   decode(value: string): string;
+  /**
+   * Embedded encoded runs to extract when the whole-string marker fails.
+   * Wrapper smuggling (`<html>2f657463…</html>`) hides hex/base64 payloads
+   * inside markup the whole-string checks reject — these keep runtime decode
+   * in parity with `vark scan`'s aggressive decoder.
+   */
+  embedded?(value: string): readonly string[];
 }
 
 const STRICT_DECODERS: readonly StrictDecoder[] = [
@@ -274,6 +281,23 @@ const STRICT_DECODERS: readonly StrictDecoder[] = [
     // keeps its random-byte decode from tripping signatures.)
     looksEncoded: (value) => /^(?:[0-9a-fA-F]{2}){4,}$/.test(value.replace(/\s+/g, '')),
     decode: decodeHexEncoding,
+    // Embedded: contiguous runs of ≥12 hex chars — long enough that prose
+    // never qualifies, short enough that smuggled paths inside wrappers
+    // still decode. Both byte-pair parities are returned so an odd-char
+    // prepend can't misalign the payload's pairs; opaque results still die
+    // at the printability gate below.
+    embedded: (value) => {
+      const runs = value.match(/[0-9a-fA-F]{12,}/g) ?? [];
+      const candidates: string[] = [];
+      for (const run of runs) {
+        const left = run.length % 2 === 0 ? run : run.slice(0, -1);
+        if (left.length >= 12) candidates.push(left);
+        const shifted = run.slice(1);
+        const right = shifted.length % 2 === 0 ? shifted : shifted.slice(0, -1);
+        if (right.length >= 12) candidates.push(right);
+      }
+      return candidates;
+    },
   },
   {
     name: 'base64',
@@ -285,8 +309,14 @@ const STRICT_DECODERS: readonly StrictDecoder[] = [
       );
     },
     decode: decodeBase64Impl,
+    // Embedded: contiguous ≥16-char base64 runs (opaque tokens still die at
+    // the printability gate below).
+    embedded: (value) => value.match(/[A-Za-z0-9+/]{16,}={0,2}/g) ?? [],
   },
 ];
+
+/** Markup tags — a wrapper that defeats whole-string encoding markers. */
+const TAG_MARKER = /<\/?[a-zA-Z!][^>]*>/;
 
 /**
  * Decode only strings with explicit encoding markers, following nested layers
@@ -295,7 +325,10 @@ const STRICT_DECODERS: readonly StrictDecoder[] = [
  *
  * This is the runtime-gate counterpart to {@link decodeAllLayers}: same
  * decoders, but strict admission so opaque tokens never become block
- * decisions.
+ * decisions. Wrapper-aware: markup wrappers are stripped into their own
+ * variant and hex/base64 runs embedded inside any string are extracted, so
+ * the runtime gate sees what `vark scan` sees (parity is covered by the
+ * decode-parity tests).
  */
 export function decodeEncodedLayers(
   text: string,
@@ -309,21 +342,43 @@ export function decodeEncodedLayers(
   for (let depth = 0; depth < maxDepth && frontier.length > 0; depth += 1) {
     const next: DecodedVariant[] = [];
     for (const { text: current, via } of frontier) {
-      for (const decoder of STRICT_DECODERS) {
-        if (!decoder.looksEncoded(current)) continue;
-        let decoded: string;
-        try {
-          decoded = decoder.decode(current);
-        } catch {
-          continue;
+      // Wrapper smuggling: strip markup so the inner payload becomes a
+      // scannable variant and the following depth decodes it whole-string.
+      if (TAG_MARKER.test(current)) {
+        const stripped = current
+          .replace(/<[^>]*>/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+        if (stripped.length > 0 && !seen.has(stripped) && isPrintableText(stripped)) {
+          seen.add(stripped);
+          out.push({ text: stripped, via: [...via, 'html-strip'] });
+          if (out.length >= MAX_DECODED_VARIANTS) return out;
+          next.push({ text: stripped, via: [...via, 'html-strip'] });
         }
-        if (!decoded || decoded === current || seen.has(decoded)) continue;
-        if (!isPrintableText(decoded)) continue;
-        seen.add(decoded);
-        const variant: DecodedVariant = { text: decoded, via: [...via, decoder.name] };
-        out.push(variant);
-        if (out.length >= MAX_DECODED_VARIANTS) return out;
-        next.push(variant);
+      }
+
+      for (const decoder of STRICT_DECODERS) {
+        const candidates: string[] = [];
+        if (decoder.looksEncoded(current)) {
+          candidates.push(current);
+        } else if (decoder.embedded !== undefined) {
+          candidates.push(...decoder.embedded(current));
+        }
+        for (const candidate of candidates) {
+          let decoded: string;
+          try {
+            decoded = decoder.decode(candidate);
+          } catch {
+            continue;
+          }
+          if (!decoded || decoded === candidate || seen.has(decoded)) continue;
+          if (!isPrintableText(decoded)) continue;
+          seen.add(decoded);
+          const variant: DecodedVariant = { text: decoded, via: [...via, decoder.name] };
+          out.push(variant);
+          if (out.length >= MAX_DECODED_VARIANTS) return out;
+          next.push(variant);
+        }
       }
     }
     frontier = next;

@@ -19,6 +19,8 @@
  * | `VARK_SESSION_TTL_MS`           | `anomaly.sessionTTLMs`           |
  * | `VARK_FREEZE_ON_INJECTION_BLOCK`| `anomaly.freezeOnInjectionBlock` |
  * | `VARK_SCHEMA_STRICT`            | `schema.strict`                  |
+ * | `VARK_MAX_DECODE_DEPTH`         | `circuitBreaker.maxDecodeDepth`  |
+ * | `VARK_STRICT_DECODE`            | `circuitBreaker.strictDecode`    |
  * | `VARK_AUDIT_HMAC_KEY`           | `audit.hmacKey`                  |
  *
  * `VARK_SIEM_WEBHOOK_URL` is read by `vark audit tail --alert` and
@@ -88,6 +90,16 @@ export function applyEnvOverrides(config: VarkConfig, env: Env = process.env): V
 
   const schemaStrict = asBool(env.VARK_SCHEMA_STRICT);
   if (schemaStrict !== undefined) out.schema = { strict: schemaStrict, ...out.schema };
+
+  const maxDecodeDepth = asPositiveInt(env.VARK_MAX_DECODE_DEPTH);
+  const strictDecode = asBool(env.VARK_STRICT_DECODE);
+  if (maxDecodeDepth !== undefined || strictDecode !== undefined) {
+    out.circuitBreaker = {
+      ...(maxDecodeDepth !== undefined ? { maxDecodeDepth } : {}),
+      ...(strictDecode !== undefined ? { strictDecode } : {}),
+      ...out.circuitBreaker,
+    };
+  }
 
   const hmacKey = env.VARK_AUDIT_HMAC_KEY;
   if (hmacKey !== undefined && hmacKey !== '' && out.audit?.hmacKey === undefined) {
