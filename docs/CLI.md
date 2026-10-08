@@ -87,21 +87,29 @@ live per-stage pipeline view: normalizer (decoded variants) → circuit breaker
 
 Circuit-breaker micro-benchmark over a mixed attack/benign payload. Prints
 avg/p50/p99/max and asserts the p99 sub-millisecond budget (exit 1 if over).
+Below the headline table, a **per-gate table** reports avg/p50/p99/max for
+every pipeline gate (anomaly, capability, breaker, schema, input-dlp,
+output-dlp+injection, audit) on representative payloads.
 
-### `vark audit verify <log>`
+### `vark audit verify [log]`
 
 Recomputes the SHA-256 hash chain from genesis over NDJSON/array logs.
 Prints record counts, a chain-dot map, and the first broken seq on corruption.
-Exit 1 when tampered.
+Exit 1 when tampered. `[log]` defaults to `$VARK_AUDIT_PATH`.
 
-### `vark audit tail <log> [-f] [-n lines]`
+### `vark audit tail [log] [-f] [-n lines] [--alert] [--webhook <url>]`
 
 Color-coded tail of an audit log by decision, with redaction counters and
-refusal reasons. `-f` follows appended records live.
+refusal reasons. `-f` follows appended records live. `--alert` prints a
+loud `⚠ ALERT` line for every security refusal as it streams in (and, with
+`--webhook` or `$VARK_SIEM_WEBHOOK_URL`, POSTs the entry there).
 
-### `vark audit export <log> --format json|csv|html [-o file]`
+### `vark audit export [log] --format json|ndjson|csv|html [-o file]`
 
-Export the trail: pretty JSON, CSV, or a single-file styled HTML report.
+Export the trail: pretty JSON, newline-delimited JSON (one record per line —
+streaming-friendly), full-field CSV (decision, reason, findings, prevHash,
+sanitizedInputs, untruncated hashes), or a single-file styled HTML report.
+`[log]` defaults to `$VARK_AUDIT_PATH`.
 
 ### `vark policy test <policy>`
 

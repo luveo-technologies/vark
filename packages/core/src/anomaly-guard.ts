@@ -40,6 +40,9 @@ export interface AnomalySessionStats {
   tokens: number;
   halted: boolean;
   haltReason: string;
+  /** Administratively locked via `freeze()`. Refuses everything until reset. */
+  frozen: boolean;
+  frozenReason: string;
 }
 
 export interface AnomalyVerdict {
@@ -50,13 +53,14 @@ export interface AnomalyVerdict {
    * - `'loop'` → identical-call limit hit (refused, session stays open)
    * - `'velocity'` → calls-per-minute exceeded (session halted)
    * - `'budget'` → lifetime call or token budget exhausted (session halted)
+   * - `'frozen'` → session administratively locked (stays locked)
    */
   cause?: AnomalyCause;
   stats: AnomalySessionStats;
 }
 
 /** Which anomaly check refused a call. */
-export type AnomalyCause = 'loop' | 'velocity' | 'budget';
+export type AnomalyCause = 'loop' | 'velocity' | 'budget' | 'frozen';
 
 interface CallRecord {
   at: number;
@@ -73,6 +77,8 @@ interface SessionState {
   haltReason: string;
   /** Why the session was halted. Empty string while open. */
   haltCause: AnomalyCause | '';
+  frozen: boolean;
+  frozenReason: string;
   calls: CallRecord[];
   identical: Map<string, number>;
 }
@@ -89,6 +95,8 @@ export class AnomalyGuard {
   readonly maxTotalCalls: number;
   readonly maxSessionTokens: number;
   readonly maxSessions: number;
+  readonly sessionTTLMs: number;
+  readonly freezeOnInjectionBlock: boolean;
   readonly enabled: boolean;
 
   readonly #sessions = new Map<string, SessionState>();
@@ -100,6 +108,8 @@ export class AnomalyGuard {
     this.maxTotalCalls = config.maxTotalCalls ?? DEFAULTS.maxTotalCalls;
     this.maxSessionTokens = config.maxSessionTokens ?? DEFAULTS.maxSessionTokens;
     this.maxSessions = config.maxSessions ?? DEFAULTS.maxSessions;
+    this.sessionTTLMs = config.sessionTTLMs ?? 0;
+    this.freezeOnInjectionBlock = config.freezeOnInjectionBlock ?? false;
     this.enabled = config.enabled !== false;
   }
 
@@ -141,10 +151,52 @@ export class AnomalyGuard {
     return [...this.#sessions.keys()];
   }
 
-  /** Reset one session (or every session when `sessionId` is omitted). */
+  /** Reset one session (or every session when `sessionId` is omitted). Also unfreezes. */
   reset(sessionId?: string): void {
     if (sessionId === undefined) this.#sessions.clear();
     else this.#sessions.delete(sessionId);
+  }
+
+  /**
+   * Administratively lock a session: every later call is refused with cause
+   * `'frozen'` until `reset()` clears it. Returns false when the session
+   * does not exist (nothing is created).
+   */
+  freeze(sessionId: string, reason = 'session frozen by operator'): boolean {
+    const session = this.#sessions.get(sessionId);
+    if (!session) return false;
+    session.frozen = true;
+    session.frozenReason = reason;
+    session.lastSeen = Date.now();
+    return true;
+  }
+
+  /** Lift a freeze without wiping counters. Returns false when not frozen. */
+  unfreeze(sessionId: string): boolean {
+    const session = this.#sessions.get(sessionId);
+    if (!session || !session.frozen) return false;
+    session.frozen = false;
+    session.frozenReason = '';
+    session.lastSeen = Date.now();
+    return true;
+  }
+
+  /**
+   * Drop idle sessions older than `sessionTTLMs`. Halted and frozen sessions
+   * are always retained — evicting them would silently resurrect a stopped
+   * agent. Returns the number of sessions evicted. No-op when TTL is off.
+   */
+  sweepExpired(now: number = Date.now()): number {
+    if (this.sessionTTLMs <= 0) return 0;
+    let evicted = 0;
+    for (const [id, session] of this.#sessions) {
+      if (session.halted || session.frozen) continue;
+      if (now - session.lastSeen > this.sessionTTLMs) {
+        this.#sessions.delete(id);
+        evicted += 1;
+      }
+    }
+    return evicted;
   }
 
   #evaluate(
@@ -163,13 +215,18 @@ export class AnomalyGuard {
         session.haltReason = reason;
         session.haltCause = cause;
       }
-      if (consume && !session.halted) this.#commit(session, fingerprint, tokenCost);
+      // Frozen sessions never consume: a lock must not grow counters.
+      if (consume && !session.halted && !session.frozen) this.#commit(session, fingerprint, tokenCost);
       return { safe: false, reason, cause, stats: this.#snapshot(session, fingerprint, identicalBefore) };
     };
 
     if (!this.enabled) {
       if (consume) this.#commit(session, fingerprint, tokenCost);
       return { safe: true, stats: this.#snapshot(session, fingerprint, identicalBefore) };
+    }
+
+    if (session.frozen) {
+      return refuse(`session "${session.id}" is frozen: ${session.frozenReason}`, false, 'frozen');
     }
 
     if (session.halted) {
@@ -241,6 +298,8 @@ export class AnomalyGuard {
       tokens: session.tokens,
       halted: session.halted,
       haltReason: session.haltReason,
+      frozen: session.frozen,
+      frozenReason: session.frozenReason,
     };
   }
 
@@ -264,6 +323,8 @@ export class AnomalyGuard {
       halted: false,
       haltReason: '',
       haltCause: '',
+      frozen: false,
+      frozenReason: '',
       calls: [],
       identical: new Map(),
     };

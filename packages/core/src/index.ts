@@ -29,7 +29,15 @@ export type { InspectionBenchmark } from './circuit-breaker.js';
 export { analyzeCompression, compressSchema, estimateTokens } from './compressor.js';
 export type { CompressionReport } from './compressor.js';
 
-export { redactText, redactValue, scanSecrets } from './dlp.js';
+export {
+  redactText,
+  redactValue,
+  scanSecrets,
+  luhnCheck,
+  shannonEntropy,
+  HIGH_ENTROPY_THRESHOLD,
+  HIGH_ENTROPY_MIN_LENGTH,
+} from './dlp.js';
 export type { DlpMatch, DlpScanResult, DlpValueResult } from './dlp.js';
 
 export {
@@ -56,7 +64,8 @@ export {
 } from './isolated-vm.js';
 export type { IsolateConfig, IsolateResult } from './isolated-vm.js';
 
-export { validateSchema, coerceValue } from './schema-validator.js';
+export { validateSchema, coerceValue, coerceValueDeep } from './schema-validator.js';
+export { applyEnvOverrides } from './env-config.js';
 export type { SchemaValidationResult } from './schema-validator.js';
 
 // ── Enterprise security modules ─────────────────────────────────────────────
@@ -73,6 +82,16 @@ export * from './security/egress/index.js';
 export * from './security/audit/index.js';
 export * from './security/replay/index.js';
 export * from './security/telemetry/index.js';
+export * from './security/sanitization/index.js';
+export * from './security/network/index.js';
+export * from './security/paths/index.js';
+export * from './security/shell/index.js';
+export * from './gates/index.js';
+export * from './security/sanitization/index.js';
+export * from './security/network/index.js';
+export * from './security/paths/index.js';
+export * from './security/shell/index.js';
+export * from './gates/index.js';
 
 export { INJECTION_MARKER, sanitizeIndirectInjection, scanIndirectInjection } from './indirect-injection.js';
 export type {
@@ -118,9 +137,11 @@ export type {
   ExecutionContext,
   GateDecision,
   GuardResult,
+  HitlRuntimeConfig,
   IndirectInjectionConfig,
   InspectionResult,
   IsolationMode,
+  SchemaValidationConfig,
   ToolDefinition,
   ToolExecutionResult,
   VarkConfig,

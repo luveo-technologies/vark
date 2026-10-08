@@ -3,7 +3,7 @@
  * Protocol tool descriptors and the vark guard pipeline.
  */
 
-export { VarkMCPAdapter, wrapMCPTools } from './bridge.js';
+export { VarkMCPAdapter, wrapMCPTools, hashDescriptor } from './bridge.js';
 export type {
   MCPExecutor,
   MCPToolLike,

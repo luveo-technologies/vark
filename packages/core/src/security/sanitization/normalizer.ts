@@ -93,6 +93,7 @@ export function normalizeInput(text: string, config: NormalizerConfig = {}): str
  * joiners, full-width lookalikes, bidi controls) without paying for
  * normalization on clean input.
  */
+// eslint-disable-next-line no-control-regex -- the full ASCII range includes control chars by definition
 const ASCII_ONLY = /^[\x00-\x7F]*$/;
 
 export function normalizeForScan(text: string, config: NormalizerConfig = {}): string {
@@ -202,4 +203,131 @@ export function normalizeAndDecode(
   const layers = decodeAllLayers(normalized, config);
   // Also include the normalized-but-not-decoded version
   return [normalized, ...layers.filter((l) => l !== normalized)];
+}
+
+// ── Strict runtime decoding ─────────────────────────────────────────────────
+// decodeAllLayers() above is intentionally aggressive: it decodes anything
+// that *can* decode, which is right for the `vark scan` analysis tool where a
+// human reviews every variant. The runtime gate below is stricter — it only
+// decodes strings that exhibit *explicit encoding markers*, and only keeps
+// variants that look like text. That keeps opaque tokens (git SHAs, UUIDs,
+// session IDs — all valid base64/hex shapes) from decoding into random bytes
+// and tripping single-character signatures.
+
+/** One decoded variant plus the decoder chain that produced it. */
+export interface DecodedVariant {
+  text: string;
+  /** Decoder names applied in order, e.g. `['base64', 'url']`. */
+  via: string[];
+}
+
+/** Maximum decoded variants examined per input string. */
+const MAX_DECODED_VARIANTS = 16;
+
+/** Decoded variants longer than this are skipped (blowup guard). */
+const MAX_DECODED_BYTES = 65_536;
+
+/**
+ * Minimum fraction of printable ASCII (0x20–0x7E plus tab/LF/CR) a decoded
+ * variant must contain to be scanned. Random binary decodes to ~30–40%;
+ * genuine smuggled commands are ~100%.
+ */
+const MIN_PRINTABLE_RATIO = 0.7;
+
+/** Minimum decoded length worth scanning. */
+const MIN_DECODED_LENGTH = 4;
+
+function isPrintableText(text: string): boolean {
+  if (text.length < MIN_DECODED_LENGTH || text.length > MAX_DECODED_BYTES) return false;
+  let printable = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if ((code >= 0x20 && code <= 0x7e) || code === 0x09 || code === 0x0a || code === 0x0d) {
+      printable += 1;
+    }
+  }
+  return printable / text.length >= MIN_PRINTABLE_RATIO;
+}
+
+interface StrictDecoder {
+  name: 'url' | 'html' | 'hex' | 'base64';
+  /** Cheap marker test: does the input even look like this encoding? */
+  looksEncoded(value: string): boolean;
+  decode(value: string): string;
+}
+
+const STRICT_DECODERS: readonly StrictDecoder[] = [
+  {
+    name: 'url',
+    looksEncoded: (value) => /%[0-9A-Fa-f]{2}/.test(value),
+    decode: decodeUrlEncoding,
+  },
+  {
+    name: 'html',
+    looksEncoded: (value) => /&(?:#\d+|#x[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]+);/.test(value),
+    decode: decodeHtmlEntities,
+  },
+  {
+    name: 'hex',
+    // Whole trimmed string must be even-length hex, minimum 8 chars.
+    // (A git SHA matches this shape — the printability gate below is what
+    // keeps its random-byte decode from tripping signatures.)
+    looksEncoded: (value) => /^(?:[0-9a-fA-F]{2}){4,}$/.test(value.replace(/\s+/g, '')),
+    decode: decodeHexEncoding,
+  },
+  {
+    name: 'base64',
+    looksEncoded: (value) => {
+      const compact = value.replace(/\s+/g, '');
+      return (
+        compact.length >= 12 &&
+        /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(compact)
+      );
+    },
+    decode: decodeBase64Impl,
+  },
+];
+
+/**
+ * Decode only strings with explicit encoding markers, following nested layers
+ * (base64→hex→URL, …) up to `maxDecodeDepth`. Every emitted variant is
+ * text-like per {@link MIN_PRINTABLE_RATIO}.
+ *
+ * This is the runtime-gate counterpart to {@link decodeAllLayers}: same
+ * decoders, but strict admission so opaque tokens never become block
+ * decisions.
+ */
+export function decodeEncodedLayers(
+  text: string,
+  config: NormalizerConfig = {},
+): DecodedVariant[] {
+  const maxDepth = config.maxDecodeDepth ?? 5;
+  const out: DecodedVariant[] = [];
+  const seen = new Set<string>([text]);
+  let frontier: DecodedVariant[] = [{ text, via: [] }];
+
+  for (let depth = 0; depth < maxDepth && frontier.length > 0; depth += 1) {
+    const next: DecodedVariant[] = [];
+    for (const { text: current, via } of frontier) {
+      for (const decoder of STRICT_DECODERS) {
+        if (!decoder.looksEncoded(current)) continue;
+        let decoded: string;
+        try {
+          decoded = decoder.decode(current);
+        } catch {
+          continue;
+        }
+        if (!decoded || decoded === current || seen.has(decoded)) continue;
+        if (!isPrintableText(decoded)) continue;
+        seen.add(decoded);
+        const variant: DecodedVariant = { text: decoded, via: [...via, decoder.name] };
+        out.push(variant);
+        if (out.length >= MAX_DECODED_VARIANTS) return out;
+        next.push(variant);
+      }
+    }
+    frontier = next;
+  }
+
+  return out;
 }

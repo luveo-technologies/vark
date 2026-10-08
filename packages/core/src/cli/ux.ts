@@ -122,6 +122,7 @@ export function table(
   const widths: number[] = [];
   for (const row of rows) {
     row.forEach((cell, i) => {
+      // eslint-disable-next-line no-control-regex -- ANSI SGR sequences are control chars by definition
       const len = String(cell).replace(/\u001b\[[0-9;]*m/g, '').length;
       widths[i] = Math.max(widths[i] ?? 0, len);
     });
@@ -130,6 +131,7 @@ export function table(
     const line = row
       .map((cell, i) => {
         const raw = String(cell);
+        // eslint-disable-next-line no-control-regex -- ANSI SGR sequences are control chars by definition
         const plain = raw.replace(/\u001b\[[0-9;]*m/g, '');
         return raw + ' '.repeat(Math.max(0, (widths[i] ?? 0) - plain.length));
       })

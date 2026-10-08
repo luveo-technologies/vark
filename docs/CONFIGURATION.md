@@ -2,21 +2,27 @@
 
 ## Environment Variables
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `VARK_ISOLATION` | Isolation mode (`process`, `wasm`, `mock`) | `process` |
-| `VARK_ISOLATION_MEMORY_MB` | Memory ceiling for isolated execution | `64` |
-| `VARK_AUDIT_PATH` | Path for persistent audit log | — |
-| `VARK_AUDIT_HMAC_KEY` | HMAC key for audit signing | — |
-| `VARK_DLP_MODE` | DLP mode (`redact`, `block`) | `redact` |
-| `VARK_INJECTION_MODE` | Injection filter mode (`sanitize`, `block`, `flag`) | `sanitize` |
-| `VARK_ANOMALY_MAX_CALLS_PER_MIN` | Max calls per minute per session | `30` |
-| `VARK_ANOMALY_MAX_IDENTICAL_CALLS` | Max identical calls per session | `3` |
-| `VARK_SCHEMA_STRICT` | Strict schema validation (no coercion) | `false` |
-| `VARK_HITL_ENABLED` | Enable HITL gate | `false` |
-| `VARK_CANARY_ENABLED` | Enable honeytoken seeding | `false` |
-| `VARK_SIEM_WEBHOOK_URL` | SIEM webhook URL | — |
-| `VARK_SIEM_AUTH_TOKEN` | SIEM authentication token | — |
+Environment variables fill in only what the programmatic `VarkConfig`
+leaves unset — **explicit config wins over the environment**, and values
+that fail to parse are ignored rather than throwing
+(`applyEnvOverrides()`).
+
+| Variable | Maps to | Description | Default |
+|----------|---------|-------------|---------|
+| `VARK_ISOLATION` | `isolation` | Requested isolation backend (`process`, `wasm`, `mock`). `wasm` warns once at first execute when true isolation can't engage. | `process` |
+| `VARK_AUDIT_PATH` | CLI | Default log path for `vark audit verify\|tail\|export` when `[log]` is omitted | — |
+| `VARK_AUDIT_HMAC_KEY` | `audit.hmacKey` | HMAC-SHA256 key for tamper-evident audit entries | — |
+| `VARK_DLP_MODE` | `dlp.mode` | DLP mode (`redact`, `block`) | `redact` |
+| `VARK_INJECTION_MODE` | `indirectInjection.mode` | Injection filter mode (`sanitize`, `block`, `flag`) | `sanitize` |
+| `VARK_ANOMALY_MAX_CALLS_PER_MIN` | `anomaly.maxCallsPerMinute` | Max calls per minute per session | `30` |
+| `VARK_ANOMALY_MAX_IDENTICAL_CALLS` | `anomaly.maxIdenticalCalls` | Max identical calls per session | `3` |
+| `VARK_SESSION_TTL_MS` | `anomaly.sessionTTLMs` | Idle-session TTL before `sweepExpired()` evicts it | `0` (off) |
+| `VARK_FREEZE_ON_INJECTION_BLOCK` | `anomaly.freezeOnInjectionBlock` | Freeze the session when gate 7 blocks (`true`/`1`/`false`/`0`) | `false` |
+| `VARK_SCHEMA_STRICT` | `schema.strict` | Strict schema validation (reject instead of coerce) | `false` |
+| `VARK_SIEM_WEBHOOK_URL` | `vark audit tail --alert` | Webhook that alert entries are POSTed to | — |
+
+HITL approvals and canary seeding are programmatic APIs (`VarkConfig.hitl`,
+the canary module) — there is no environment toggle for them.
 
 ## VarkConfig
 
@@ -66,7 +72,16 @@ interface VarkConfig {
     maxTotalCalls?: number;         // default: 1_000
     maxSessionTokens?: number;      // default: 250_000
     maxSessions?: number;           // default: 1_000
+    sessionTTLMs?: number;          // idle-session TTL, default: 0 (off)
+    freezeOnInjectionBlock?: boolean; // freeze session on gate-7 block, default: false
     enabled?: boolean;              // default: true
+  };
+
+  // Human-in-the-loop (opt-in)
+  hitl?: {
+    gate: HitlGate;                 // holds capabilities + pending approvals
+    tools: Record<string, string>;  // tool name → capability id
+    timeoutMs?: number;             // default: 60_000 (fail-closed)
   };
 
   // Audit
@@ -124,6 +139,8 @@ interface AnomalyGuardConfig {
   maxTotalCalls?: number;         // default: 1_000
   maxSessionTokens?: number;      // default: 250_000
   maxSessions?: number;           // default: 1_000
+  sessionTTLMs?: number;          // idle TTL for sweepExpired(), default: 0 (off)
+  freezeOnInjectionBlock?: boolean; // freeze session when gate 7 blocks, default: false
   enabled?: boolean;              // default: true
 }
 ```
@@ -167,6 +184,16 @@ interface IsolationConfig {
   allowFallback?: boolean;             // default: true
 }
 ```
+
+> **Honesty note.** The guard pipeline (gate 5) always executes `run()`
+> in-process — with the capability sandbox and a wall-clock timeout —
+> because tool closures need module scope and `ctx.sandbox` carries live
+> functions that cannot cross an isolate boundary. `isolation: 'wasm'`
+> controls the *standalone* isolate APIs (`executeInSandbox()`,
+> `executeIsolated()`, `resolveIsolationMode()`); when the runtime is
+> configured with `'wasm'` it warns **once** at the first `execute()`
+> stating exactly this, and `resolveIsolationMode()` reports any fallback
+> from true isolation. Nothing degrades silently.
 
 ## QuotaConfig
 

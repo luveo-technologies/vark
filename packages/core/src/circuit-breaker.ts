@@ -8,7 +8,7 @@
  */
 
 import type { CircuitBreakerConfig, InspectionResult } from './types.js';
-import { normalizeForScan } from './security/sanitization/normalizer.js';
+import { normalizeForScan, decodeEncodedLayers } from './security/sanitization/normalizer.js';
 
 interface PayloadPattern {
   id: string;
@@ -96,20 +96,37 @@ export function inspectPayload(
     }
 
     if (typeof value === 'string') {
+      // Canonical form for the follow-up passes below. Pure-ASCII input
+      // short-circuits inside normalizeForScan (identity), so clean payloads
+      // pay for one cheap regex and nothing more.
+      const canonical = normalizeForScan(value);
       let result = testPatterns(value, shellPatterns, argName);
       if (result.safe) result = testPatterns(value, pathPatterns, argName);
+      if (result.safe && canonical !== value) {
+        // Second pass: catches visual-spoofing obfuscation (zero-width
+        // chars, full-width homoglyphs, bidi controls) that raw patterns
+        // cannot see.
+        result = testPatterns(canonical, shellPatterns, argName);
+        if (result.safe) result = testPatterns(canonical, pathPatterns, argName);
+        if (!result.safe) {
+          result = { safe: false, reason: `${result.reason} (normalized input)` };
+        }
+      }
       if (result.safe) {
-        // Second pass over the canonical form: catches visual-spoofing
-        // obfuscation (zero-width chars, full-width homoglyphs, bidi
-        // controls) that the raw patterns cannot see. Pure-ASCII input
-        // short-circuits inside normalizeForScan, so clean payloads pay
-        // for one cheap regex and nothing more.
-        const canonical = normalizeForScan(value);
-        if (canonical !== value) {
-          result = testPatterns(canonical, shellPatterns, argName);
-          if (result.safe) result = testPatterns(canonical, pathPatterns, argName);
+        // Third pass over strictly-decoded variants: catches smuggled
+        // encodings (percent-encoding, HTML entities, hex, base64, nested).
+        // Only strings with explicit encoding markers are decoded, and only
+        // text-like results are scanned — opaque tokens (hashes, UUIDs,
+        // session IDs) can never trip this pass.
+        for (const variant of decodeEncodedLayers(canonical)) {
+          result = testPatterns(variant.text, shellPatterns, argName);
+          if (result.safe) result = testPatterns(variant.text, pathPatterns, argName);
           if (!result.safe) {
-            result = { safe: false, reason: `${result.reason} (normalized input)` };
+            result = {
+              safe: false,
+              reason: `${result.reason} (decoded ${variant.via.join('→')})`,
+            };
+            break;
           }
         }
       }

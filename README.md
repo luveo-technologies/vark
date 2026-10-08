@@ -1,6 +1,6 @@
 # vark
 
-> ⚠️ **Under active development — v0.1.2.** This project is functional but
+> ⚠️ **Under active development — v0.2.0.** This project is functional but
 > pre-release: expect bugs, sharp edges, and breaking changes between
 > versions. Do not rely on it as your sole security boundary in production
 > yet. Found something? Report it — see `SECURITY.md`.
@@ -19,15 +19,15 @@ and compresses tool schemas to save LLM tokens.
  [tool call]
       │
       ▼
- 1. anomaly guard ──── identical-call loop / velocity / budget      → LOOP_BLOCKED
+ 1. anomaly guard ──── identical-call loop / velocity / budget      → LOOP_BLOCKED · VELOCITY_EXCEEDED · BUDGET_EXCEEDED · SESSION_FROZEN
       │
  2. capability sandbox ─ path & host authorisation                  → CAPABILITY_VIOLATION
       │
- 3. circuit breaker ── shell injection, path traversal              → CIRCUIT_BREAKER
+ 3. circuit breaker ── shell injection, path traversal, encodings   → CIRCUIT_BREAKER
       │
  4. input DLP ──────── strip secrets from the arguments             → DLP_REDACTED
       │
- 5. execution ──────── run() + timeout, privileged readFile/fetch   → TIMEOUT / EXECUTION_ERROR
+ 5. execution ──────── run() + timeout, HITL approval, sandbox      → TIMEOUT / HITL_DENIED / EXECUTION_ERROR
       │
  6. output DLP ─────── strip secrets from the return value          → DLP_REDACTED
       │
@@ -80,6 +80,28 @@ await read.execute({ path: '../../etc/passwd' });
 
 runtime.audit.trail();   // hash-chained telemetry for every call above
 ```
+
+## Install from a local build (no publish)
+
+To evaluate an unreleased version — an AI reviewer, a staging box, an air
+gapped machine — without publishing to npm:
+
+```bash
+pnpm build            # dist/ must exist in both packages
+pnpm pack:local       # → local-pack/*.tgz, workspace:* deps rewritten to 0.2.0
+```
+
+Then in any consumer project, install **both** tarballs in one command so
+npm resolves the MCP adapter's `@luveo-tech/vark` dependency from the local
+core tarball instead of the registry:
+
+```bash
+npm install ../Vark/local-pack/luveo-tech-vark-0.2.0.tgz \
+            ../Vark/local-pack/luveo-tech-vark-mcp-0.2.0.tgz
+```
+
+(Inside this monorepo no packing is needed — `pnpm install` links the
+packages via `workspace:*`.)
 
 ## CLI
 
@@ -136,7 +158,9 @@ interface ToolExecutionResult<T> {
   data?: T;
   error?: string;                 // the human-readable refusal reason
   blockedBy?: 'CIRCUIT_BREAKER' | 'CAPABILITY_VIOLATION' | 'TIMEOUT' | 'EXECUTION_ERROR'
-           | 'DLP_REDACTED' | 'INDIRECT_INJECTION' | 'LOOP_BLOCKED';
+           | 'DLP_REDACTED' | 'INDIRECT_INJECTION' | 'LOOP_BLOCKED'
+           | 'VELOCITY_EXCEEDED' | 'BUDGET_EXCEEDED' | 'DESCRIPTOR_PIN_VIOLATION'
+           | 'SESSION_FROZEN' | 'HITL_DENIED';
   executionTimeMs: number;
   sessionId?: string;             // agent session that produced the call
   inputRedactions?: number;       // secrets stripped before run()
@@ -201,7 +225,9 @@ runtime.resetSession('agent-7');
 ```
 
 Loop violations refuse only that call; velocity and budget violations **halt
-the session** — every later call is refused with `LOOP_BLOCKED`. Vark does not
+the session** — every later call is refused with the matching code
+(`VELOCITY_EXCEEDED` / `BUDGET_EXCEEDED`), and `freezeSession()` locks one
+outright (`SESSION_FROZEN`) until `resetSession()`. Vark does not
 call `process.exit()`: a security guard must not crash its host, and a halted
 session leaves the operator a live process plus a readable audit trail.
 
@@ -216,7 +242,9 @@ runtime.audit.toJSONL();   // append-only JSON Lines export
 
 Each record carries `seq`, ISO timestamp, session, tool, `decision`
 (`ALLOWED` · `CIRCUIT_BREAKER` · `CAPABILITY_VIOLATION` · `DLP_REDACTED` ·
-`INDIRECT_INJECTION` · `LOOP_BLOCKED` · `TIMEOUT` · `EXECUTION_ERROR`),
+`INDIRECT_INJECTION` · `LOOP_BLOCKED` · `VELOCITY_EXCEEDED` ·
+`BUDGET_EXCEEDED` · `DESCRIPTOR_PIN_VIOLATION` · `SESSION_FROZEN` ·
+`HITL_DENIED` · `TIMEOUT` · `EXECUTION_ERROR`),
 sanitised inputs, redaction counters, `executionTimeMs`, `inspectionMs`
 (circuit-breaker latency), CTP `tokensSaved` and `prevHash`/`hash`.
 

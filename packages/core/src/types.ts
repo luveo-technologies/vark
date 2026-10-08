@@ -5,6 +5,8 @@
  * result of a guarded execution.
  */
 
+import type { HitlGate } from './gates/hitl-gate.js';
+
 /** Isolation backend used to run tool bodies. */
 export type IsolationMode = 'process' | 'wasm' | 'mock';
 
@@ -87,6 +89,17 @@ export interface AnomalyGuardConfig {
   maxSessionTokens?: number;
   /** Sessions kept in memory (least-recently-used evicted). @default 1_000 */
   maxSessions?: number;
+  /**
+   * Idle-session TTL in ms. Sessions idle longer than this are dropped by
+   * `sweepExpired()` (halted/frozen sessions are retained). @default 0 (off)
+   */
+  sessionTTLMs?: number;
+  /**
+   * Freeze the session when gate 7 blocks a call (`mode: 'block'`).
+   * Frozen sessions refuse everything until `resetSession()`.
+   * @default false
+   */
+  freezeOnInjectionBlock?: boolean;
   /** @default true */
   enabled?: boolean;
 }
@@ -147,6 +160,22 @@ export interface IsolationConfig {
   allowFallback?: boolean;
 }
 
+/** Human-in-the-loop approval policy for high-risk tools. */
+export interface HitlRuntimeConfig {
+  /** Gate instance holding capabilities and pending approvals. */
+  gate: HitlGate;
+  /**
+   * Tool name → capability id. Only mapped tools pause for approval;
+   * everything else executes normally.
+   */
+  tools: Record<string, string>;
+  /**
+   * Per-approval wait budget. Undecided requests expire into denials
+   * (fail-closed). @default 60_000
+   */
+  timeoutMs?: number;
+}
+
 /** Top-level runtime configuration. */
 export interface VarkConfig {
   /**
@@ -171,16 +200,23 @@ export interface VarkConfig {
   audit?: AuditLoggerConfig;
   /** Runtime schema validation gate. */
   schema?: SchemaValidationConfig;
+  /**
+   * Human-in-the-loop approvals. When set, tools mapped in
+   * `hitl.tools` pause in gate 5 until approved; denials and timeouts
+   * refuse with `blockedBy: 'HITL_DENIED'`.
+   */
+  hitl?: HitlRuntimeConfig;
   /** Initial agent session id. @default 'default' */
   sessionId?: string;
 }
 
 /** A tool exposed to the agent, guarded by vark. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- `any` defaults are deliberate: `unknown` would break contextual inference for consumers writing `run: (args) => args.path`. Explicit type arguments still narrow.
 export interface ToolDefinition<TArgs = any, TResult = any> {
   name: string;
   description: string;
   /** Standard JSON Schema (or plain object schema) describing `TArgs`. */
-  schema: Record<string, any>;
+  schema: Record<string, unknown>;
   /** Privilege grants. Merged over `VarkConfig.defaultCapabilities`. */
   capabilities?: CapabilityConfig;
   run: (args: TArgs, context: ExecutionContext) => Promise<TResult>;
@@ -204,7 +240,10 @@ export type BlockedBy =
   | 'INDIRECT_INJECTION'
   | 'LOOP_BLOCKED'
   | 'VELOCITY_EXCEEDED'
-  | 'BUDGET_EXCEEDED';
+  | 'BUDGET_EXCEEDED'
+  | 'DESCRIPTOR_PIN_VIOLATION'
+  | 'SESSION_FROZEN'
+  | 'HITL_DENIED';
 
 /** Terminal gate decision recorded in the audit trail. */
 export type GateDecision =
@@ -216,6 +255,9 @@ export type GateDecision =
   | 'LOOP_BLOCKED'
   | 'VELOCITY_EXCEEDED'
   | 'BUDGET_EXCEEDED'
+  | 'DESCRIPTOR_PIN_VIOLATION'
+  | 'SESSION_FROZEN'
+  | 'HITL_DENIED'
   | 'TIMEOUT'
   | 'EXECUTION_ERROR';
 
@@ -226,7 +268,7 @@ export interface ExecutionOptions {
 }
 
 /** Outcome of a guarded tool execution. Always returned, never thrown. */
-export interface ToolExecutionResult<T = any> {
+export interface ToolExecutionResult<T = unknown> {
   success: boolean;
   data?: T;
   error?: string;

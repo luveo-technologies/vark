@@ -25,7 +25,7 @@ export interface CompressionReport {
   savedPercent: number;
 }
 
-type JsonSchemaLike = Record<string, any>;
+type JsonSchemaLike = Record<string, unknown>;
 
 /** Rough public heuristic: ≈4 characters per token. */
 export function estimateTokens(text: string): number {
@@ -55,7 +55,7 @@ function isSimpleType(type: string): boolean {
 }
 
 function objectType(node: JsonSchemaLike): string {
-  const properties: JsonSchemaLike = node.properties ?? {};
+  const properties = (node.properties ?? {}) as JsonSchemaLike;
   const required = new Set<string>(Array.isArray(node.required) ? node.required : []);
   const entries = Object.entries(properties);
 
@@ -136,7 +136,7 @@ function resolveType(node: unknown): string | undefined {
 }
 
 function buildSignature(schema: JsonSchemaLike): string {
-  const properties: JsonSchemaLike = schema.properties ?? {};
+  const properties = (schema.properties ?? {}) as JsonSchemaLike;
   const required = new Set<string>(Array.isArray(schema.required) ? schema.required : []);
 
   const params = Object.entries(properties).map(([key, sub]) => {

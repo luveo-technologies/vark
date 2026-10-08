@@ -75,6 +75,13 @@ const PATTERNS: readonly InjectionPattern[] = [
       /\b(?:send|post|upload|exfiltrate|forward|email|transmit|curl)\b[^.\n]{0,120}\b(?:environment\s+variables?|env\s+vars?|secrets?|credentials?|passwords?|api\s+keys?|access\s+tokens?|private\s+keys?|auth\s+tokens?)\b[^.\n]{0,120}/gi,
   },
   {
+    // Markdown image beacons smuggling data in long query strings:
+    // ![anything](https://host/path?query≥32chars). Ordinary doc images
+    // with short queries never match.
+    type: 'MD_IMAGE_EXFIL',
+    regex: /!\[[^\]\n]{0,200}\]\(\s*https?:\/\/[^\s)]*\?[^\s)]{32,}\)/gi,
+  },
+  {
     type: 'JAILBREAK_MODE',
     regex: /\b(?:developer\s+mode|jailbreak|do\s+anything\s+now|evil\s+mode|hypothetical\s+mode|DAN\s+mode)\b/gi,
   },

@@ -103,7 +103,10 @@ async function loadPayload(file: string): Promise<unknown> {
   try {
     return JSON.parse(content);
   } catch (error) {
-    throw new Error(`Failed to parse ${file}: ${error instanceof Error ? error.message : String(error)}`);
+    throw new Error(
+      `Failed to parse ${file}: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
   }
 }
 
@@ -220,5 +223,8 @@ const VERBOSE_HINTS: Record<string, string> = {
   DLP_REDACTED: 'rotate the credential; it never reached the tool',
   INDIRECT_INJECTION: 'treat tool output as untrusted input',
   TIMEOUT: 'raise maxExecutionMs or split the work',
+  DESCRIPTOR_PIN_VIOLATION: 're-wrap tools to accept the new descriptor, or investigate the server',
+  SESSION_FROZEN: 'review the audit trail, then resetSession() to unfreeze',
+  HITL_DENIED: 'approve via the HitlGate or raise hitl.timeoutMs',
   EXECUTION_ERROR: 'compare args against the tool schema',
 };

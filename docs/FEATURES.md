@@ -69,7 +69,11 @@ const quotas = new ResourceQuota({
 // Check before execution
 const check = quotas.checkExecution('session-1');
 if (!check.allowed) {
-  console.error(check.reason);
+  console.error(check.reason, check.code);
+  // → 'Memory quota exceeded: 268435456 > 100 bytes', 'QUOTA_MEMORY'
+  // Every refusal carries a machine-readable `QuotaCode` (0.2.0+):
+  // QUOTA_CPU_TIME · QUOTA_MEMORY · QUOTA_SUBPROCESS ·
+  // QUOTA_FILE_DESCRIPTORS · QUOTA_OUTPUT — for SIEM routing/alerting.
 }
 
 // Record usage during execution
@@ -110,6 +114,12 @@ runtime.tool({
   run: async (args) => { /* ... */ },
 });
 ```
+
+With `strict: false` (default) mismatches are coerced **recursively** —
+`{ age: '42' }` against `properties.age.type: 'integer'` becomes
+`{ age: 42 }`, including nested objects and array items
+(`coerceValueDeep`, copy-on-write; the input object is never mutated).
+`strict: true` rejects instead.
 
 ### 5. Semantic & Embedding Injection Detector
 
@@ -206,6 +216,20 @@ if (decision.approved) {
 
 // Approve from external system
 hitl.approve('hitl_123', 'admin@example.com', 'Verified with manager');
+```
+
+**Wired into the runtime (since 0.2.0).** The gate can pause `execute()`
+itself — map tool names to capabilities and the pipeline awaits approval
+before `run()`:
+
+```ts
+const runtime = new VarkRuntime({
+  hitl: { gate, tools: { drop_table: 'db:drop' }, timeoutMs: 60_000 },
+});
+
+await runtime.execute('drop_table', { table: 'users' });
+// denied  → { success: false, blockedBy: 'HITL_DENIED', error: '… denied by ops@example.com' }
+// pending → fails closed after timeoutMs: '… timed out awaiting approval'
 ```
 
 ### 10. Stateful DAG Flow Enforcement

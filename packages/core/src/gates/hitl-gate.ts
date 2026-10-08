@@ -79,12 +79,16 @@ export class HitlGate {
   /**
    * Request approval for a high-risk capability.
    * Returns a promise that resolves when the request is approved or denied.
+   * With `opts.timeoutMs`, an undecided request expires into a denial after
+   * the budget elapses (fail-closed); the timer is always cleared on settle
+   * so pending approvals never leak.
    */
   async requestApproval(
     capabilityId: string,
     sessionId: string,
     tool: string,
     args: unknown,
+    opts?: { timeoutMs?: number },
   ): Promise<HitlDecision> {
     const capability = this.requiresApproval(capabilityId);
     if (!capability) {
@@ -116,7 +120,26 @@ export class HitlGate {
     this.#requests.set(requestId, request);
 
     return new Promise<HitlDecision>((resolve) => {
-      this.#pendingResolvers.set(requestId, resolve);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const settle = (decision: HitlDecision): void => {
+        if (timer !== undefined) {
+          clearTimeout(timer);
+          timer = undefined;
+        }
+        this.#pendingResolvers.delete(requestId);
+        resolve(decision);
+      };
+      this.#pendingResolvers.set(requestId, (decision) => settle(decision));
+
+      if (opts?.timeoutMs !== undefined && opts.timeoutMs > 0) {
+        timer = setTimeout(() => {
+          if (request.status !== 'pending') return;
+          request.status = 'expired';
+          request.decidedBy = 'system';
+          request.decidedAt = Date.now();
+          settle({ approved: false, requestId, decidedBy: 'system', reason: 'approval timed out' });
+        }, opts.timeoutMs);
+      }
     });
   }
 

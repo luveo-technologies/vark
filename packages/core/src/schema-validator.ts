@@ -234,3 +234,46 @@ export function coerceValue(value: unknown, schema: JsonSchema): { value: unknow
   }
   return { value, coerced: false };
 }
+
+/**
+ * Recursively coerce a value against a schema: object properties and array
+ * items are coerced with their subschemas, so `{ n: '42' }` against
+ * `{ properties: { n: { type: 'integer' } } }` becomes `{ n: 42 }`.
+ *
+ * Copy-on-write: containers are only cloned when at least one descendant
+ * was coerced; otherwise the original references are returned untouched.
+ */
+export function coerceValueDeep(value: unknown, schema: JsonSchema): { value: unknown; coerced: boolean } {
+  if (!isPlainObject(schema)) return { value, coerced: false };
+
+  if ((schema.type === 'object' || schema.properties !== undefined) && isPlainObject(value)) {
+    const properties =
+      isPlainObject(schema.properties) ? (schema.properties as Record<string, JsonSchema>) : {};
+    let changed = false;
+    const out: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(value)) {
+      const sub = properties[key];
+      if (sub !== undefined) {
+        const coerced = coerceValueDeep(child, sub);
+        out[key] = coerced.value;
+        if (coerced.coerced) changed = true;
+      } else {
+        out[key] = child;
+      }
+    }
+    return changed ? { value: out, coerced: true } : { value, coerced: false };
+  }
+
+  if (schema.type === 'array' && Array.isArray(value) && isPlainObject(schema.items)) {
+    const itemSchema = schema.items as JsonSchema;
+    let changed = false;
+    const out = value.map((item) => {
+      const coerced = coerceValueDeep(item, itemSchema);
+      if (coerced.coerced) changed = true;
+      return coerced.value;
+    });
+    return changed ? { value: out, coerced: true } : { value, coerced: false };
+  }
+
+  return coerceValue(value, schema);
+}

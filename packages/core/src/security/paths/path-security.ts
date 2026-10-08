@@ -8,6 +8,7 @@
  */
 
 import { realpath } from 'node:fs/promises';
+import { openSync, fstatSync } from 'node:fs';
 import { resolve, isAbsolute, normalize } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -196,9 +197,8 @@ export async function openFileSafe(
   flags: string = 'r',
 ): Promise<{ fd?: number; error?: string }> {
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const fs = require('node:fs') as typeof import('node:fs');
-    const fd = fs.openSync(path, flags);
+    // Static import at module top: require() does not exist in ESM.
+    const fd = openSync(path, flags);
     return { fd };
   } catch (error) {
     return { error: error instanceof Error ? error.message : String(error) };
@@ -213,9 +213,8 @@ export async function verifyFileIdentity(
   expectedPath: string,
 ): Promise<{ valid: boolean; reason?: string }> {
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const fs = require('node:fs') as typeof import('node:fs');
-    const stats = fs.fstatSync(fd);
+    // Static import at module top: require() does not exist in ESM.
+    const stats = fstatSync(fd);
     // Verify the file identity by comparing the realpath
     const realPath = await realpath(expectedPath);
     if (stats.size < 0) {

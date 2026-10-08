@@ -99,6 +99,24 @@ const GATE_DOCS: GateDoc[] = [
     fix: 'Raise maxExecutionMs per tool, or break the work into smaller calls.',
   },
   {
+    gate: 'DESCRIPTOR_PIN_VIOLATION',
+    when: 'An MCP tool descriptor changed after wrapTools() pinned its hash.',
+    why: 'Servers can mutate name/description/schema mid-session (rug pull); the pinned hash no longer matches.',
+    fix: 'Re-wrap the tools to accept the new descriptor, or investigate the server.',
+  },
+  {
+    gate: 'SESSION_FROZEN',
+    when: 'The session was frozen (e.g. injection block with freezeOnInjectionBlock, or runtime.freezeSession()).',
+    why: 'A frozen session is administratively locked until reset.',
+    fix: 'Review the audit trail, then resetSession() to unfreeze.',
+  },
+  {
+    gate: 'HITL_DENIED',
+    when: 'A high-risk tool mapped in hitl.tools was denied approval or timed out waiting for it.',
+    why: 'Fail-closed: undecided approvals deny rather than execute.',
+    fix: 'Approve via the HitlGate, raise hitl.timeoutMs, or remove the tool mapping.',
+  },
+  {
     gate: 'EXECUTION_ERROR',
     when: 'run() threw, the tool is unknown, or schema validation failed.',
     why: 'Failures resolve — never throw — so the agent loop survives.',

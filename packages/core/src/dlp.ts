@@ -42,7 +42,53 @@ export interface DlpValueResult {
 interface SecretPattern {
   type: string;
   regex: RegExp;
+  /**
+   * Optional post-filter on the matched text. Return false to drop the hit.
+   * Used where shape alone over-matches (Luhn check digits, entropy floors).
+   */
+  verify?: (match: string) => boolean;
 }
+
+/** Luhn check-digit validation for payment card numbers. */
+export function luhnCheck(digits: string): boolean {
+  const nums = digits.replace(/\D/g, '');
+  if (nums.length < 13 || nums.length > 19) return false;
+  let sum = 0;
+  let double = false;
+  for (let i = nums.length - 1; i >= 0; i -= 1) {
+    let digit = Number(nums[i]);
+    if (double) {
+      digit *= 2;
+      if (digit > 9) digit -= 9;
+    }
+    sum += digit;
+    double = !double;
+  }
+  return sum % 10 === 0;
+}
+
+/** Shannon entropy in bits per character. */
+export function shannonEntropy(text: string): number {
+  if (text.length === 0) return 0;
+  const freq = new Map<string, number>();
+  for (const char of text) freq.set(char, (freq.get(char) ?? 0) + 1);
+  let entropy = 0;
+  for (const count of freq.values()) {
+    const p = count / text.length;
+    entropy -= p * Math.log2(p);
+  }
+  return entropy;
+}
+
+/**
+ * Minimum entropy for an opaque token to count as secret-shaped.
+ * Hex UUIDs top out near 4.0 bits/char; base64 session tokens, API secrets
+ * and key material sit well above 4.5.
+ */
+export const HIGH_ENTROPY_THRESHOLD = 4.5;
+
+/** Minimum token length for the entropy heuristic (avoids prose words). */
+export const HIGH_ENTROPY_MIN_LENGTH = 32;
 
 const BUILT_IN_PATTERNS: readonly SecretPattern[] = [
   {
@@ -62,6 +108,20 @@ const BUILT_IN_PATTERNS: readonly SecretPattern[] = [
     type: 'ENV_CREDENTIAL',
     regex:
       /\b[A-Z0-9_]*(?:API_?KEY|SECRET(?:_?KEY)?|PASS(?:WORD|WD)?|TOKEN|CREDENTIALS?|PRIVATE_?KEY)[A-Z0-9_]*\s*=\s*[^\s'"`]+/gi,
+  },
+  {
+    type: 'CREDIT_CARD',
+    regex: /\b(?:\d[-\s]?){13,19}\b/g,
+    verify: (match) => luhnCheck(match),
+  },
+  { type: 'SSN', regex: /\b\d{3}-\d{2}-\d{4}\b/g },
+  {
+    // Last by design: specific formats above claim their spans first, so
+    // this only fires on otherwise-unrecognized opaque tokens. Private-key
+    // bodies without markers, session tokens and API secrets land here.
+    type: 'HIGH_ENTROPY_SECRET',
+    regex: /[A-Za-z0-9_+\-/=]{32,}/g,
+    verify: (match) => shannonEntropy(match) >= HIGH_ENTROPY_THRESHOLD,
   },
 ];
 
@@ -84,12 +144,13 @@ function collectMatches(text: string, patterns: readonly SecretPattern[]): DlpMa
   const occupied: Array<[number, number]> = [];
   const hits: DlpMatch[] = [];
 
-  for (const { type, regex } of patterns) {
+  for (const { type, regex, verify } of patterns) {
     const scanner = asGlobal(regex);
     for (const match of text.matchAll(scanner)) {
       const start = match.index ?? 0;
       const length = match[0].length;
       if (length === 0) continue;
+      if (verify && !verify(match[0])) continue;
       const end = start + length;
       if (occupied.some(([from, to]) => start < to && end > from)) continue;
       occupied.push([start, end]);

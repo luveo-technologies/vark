@@ -141,13 +141,23 @@ const auditCmd = program
   .command('audit')
   .description('Audit log commands');
 
+/** `<log>` argument with `$VARK_AUDIT_PATH` fallback; exits when neither is set. */
+function resolveLogPath(log: string | undefined): string {
+  const path = log ?? process.env.VARK_AUDIT_PATH;
+  if (!path) {
+    console.error(`${red('Error:')} pass <log> or set VARK_AUDIT_PATH`);
+    process.exit(1);
+  }
+  return path;
+}
+
 auditCmd
-  .command('verify <log>')
-  .description('Verify the cryptographic integrity of an audit log hash chain')
-  .action(async (log: string) => {
+  .command('verify [log]')
+  .description('Verify the cryptographic integrity of an audit log hash chain (default $VARK_AUDIT_PATH)')
+  .action(async (log?: string) => {
     const started = Date.now();
     try {
-      const result = await runAuditVerify(log);
+      const result = await runAuditVerify(resolveLogPath(log));
       printVerifyResult(result, Date.now() - started);
     } catch (error) {
       console.error(`${red('Error:')} ${error instanceof Error ? error.message : String(error)}`);
@@ -156,13 +166,20 @@ auditCmd
   });
 
 auditCmd
-  .command('tail <log>')
-  .description('Stream audit records, color-coded by decision')
+  .command('tail [log]')
+  .description('Stream audit records, color-coded by decision (default $VARK_AUDIT_PATH)')
   .option('-f, --follow', 'Keep following appended records')
   .option('-n, --lines <n>', 'Number of trailing records to show', '10')
-  .action(async (log: string, options: { follow?: boolean; lines?: string }) => {
+  .option('--alert', 'Loud alert line for security refusals (pairs with --follow)')
+  .option('--webhook <url>', 'POST alert entries to this URL (default $VARK_SIEM_WEBHOOK_URL)')
+  .action(async (log: string | undefined, options: { follow?: boolean; lines?: string; alert?: boolean; webhook?: string }) => {
     try {
-      await runTail(log, { follow: options.follow, lines: Number(options.lines ?? 10) });
+      await runTail(resolveLogPath(log), {
+        follow: options.follow,
+        lines: Number(options.lines ?? 10),
+        alert: options.alert,
+        webhook: options.webhook,
+      });
     } catch (error) {
       console.error(`${red('Error:')} ${error instanceof Error ? error.message : String(error)}`);
       process.exit(1);
@@ -170,18 +187,18 @@ auditCmd
   });
 
 auditCmd
-  .command('export <log>')
-  .description('Export an audit trail to JSON, CSV or a styled HTML report')
-  .option('--format <format>', 'json | csv | html', 'json')
+  .command('export [log]')
+  .description('Export an audit trail to JSON, NDJSON, CSV or a styled HTML report (default $VARK_AUDIT_PATH)')
+  .option('--format <format>', 'json | ndjson | csv | html', 'json')
   .option('-o, --out <file>', 'Write to file instead of stdout')
-  .action(async (log: string, options: { format?: string; out?: string }) => {
+  .action(async (log: string | undefined, options: { format?: string; out?: string }) => {
     try {
       const format = (options.format ?? 'json') as ExportFormat;
-      if (!['json', 'csv', 'html'].includes(format)) {
-        console.error(`${red('Error:')} --format must be json, csv or html`);
+      if (!['json', 'ndjson', 'csv', 'html'].includes(format)) {
+        console.error(`${red('Error:')} --format must be json, ndjson, csv or html`);
         process.exit(1);
       }
-      const output = exportAudit(await loadEntries(log), format);
+      const output = exportAudit(await loadEntries(resolveLogPath(log)), format);
       if (options.out) {
         await writeFile(options.out, output, 'utf8');
         console.log(`  wrote ${output.length} chars → ${options.out}`);

@@ -107,6 +107,24 @@ describe('vark audit export', () => {
     expect(html).toContain('<!doctype html>');
     expect(html).toContain('vark audit report');
   });
+
+  it('csv carries the full audit entry', async () => {
+    const entries = await makeEntries();
+    const [header, ...rows] = exportAudit(entries, 'csv').split('\n');
+    for (const field of ['reason', 'findings', 'prevHash', 'sanitizedInputs']) {
+      expect(header).toContain(field);
+    }
+    expect(rows).toHaveLength(3);
+    // full 64-char hashes, not truncated
+    expect(rows[0]).toMatch(/,[0-9a-f]{64},/);
+  });
+
+  it('ndjson emits one object per line', async () => {
+    const entries = await makeEntries();
+    const lines = exportAudit(entries, 'ndjson').split('\n');
+    expect(lines).toHaveLength(3);
+    for (const line of lines) expect(() => JSON.parse(line!)).not.toThrow();
+  });
 });
 
 describe('vark canary', () => {

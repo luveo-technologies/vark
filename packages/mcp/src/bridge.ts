@@ -20,6 +20,7 @@
  */
 
 import { VarkRuntime } from '@luveo-tech/vark';
+import { createHash } from 'node:crypto';
 import type {
   CapabilityConfig,
   CompressionReport,
@@ -30,22 +31,22 @@ import type {
   ToolExecutionResult,
   VarkConfig,
 } from '@luveo-tech/vark';
-import { VarkError } from '@luveo-tech/vark';
+import { VarkError, stableStringify, DEFAULT_SESSION } from '@luveo-tech/vark';
 
 /** Shape of a raw MCP (or OpenAI-style function) tool descriptor. */
 export interface MCPToolLike {
   name: string;
   description?: string;
-  inputSchema?: Record<string, any>;
+  inputSchema?: Record<string, unknown>;
   /** OpenAI-style alias for `inputSchema`. */
-  schema?: Record<string, any>;
+  schema?: Record<string, unknown>;
   [key: string]: unknown;
 }
 
 /** Performs the real `tools/call` round trip against the MCP server. */
 export type MCPExecutor = (
   tool: MCPToolLike,
-  args: any,
+  args: Record<string, unknown>,
   context: ExecutionContext,
 ) => Promise<unknown>;
 
@@ -53,7 +54,14 @@ export type MCPExecutor = (
 export interface WrappedMCPTool {
   name: string;
   description: string;
-  inputSchema: Record<string, any>;
+  inputSchema: Record<string, unknown>;
+  /**
+   * SHA-256 pin of `{ name, description, inputSchema }` taken at wrap time.
+   * Every `check()`/`execute()` recomputes it — a mismatch means the
+   * descriptor was mutated after wrapping (MCP rug pull) and the call is
+   * refused with `DESCRIPTOR_PIN_VIOLATION`.
+   */
+  descriptorHash: string;
   /** Effective grants (defaults merged with the per-wrap defaults). */
   capabilities: CapabilityConfig;
   /** CTP signature for this tool. */
@@ -64,6 +72,35 @@ export interface WrappedMCPTool {
   check: (args?: unknown, options?: ExecutionOptions) => GuardResult;
   /** Guarded execution — runs the payload through vark, then the MCP server. */
   execute: (args?: unknown, options?: ExecutionOptions) => Promise<ToolExecutionResult>;
+}
+
+/** Canonical descriptor fingerprint for rug-pull detection. */
+export function hashDescriptor(tool: Pick<MCPToolLike, 'name' | 'description' | 'inputSchema' | 'schema'>): string {
+  const canonical = stableStringify({
+    name: tool.name,
+    description: tool.description ?? '',
+    inputSchema: tool.inputSchema ?? tool.schema ?? {},
+  });
+  return createHash('sha256').update(canonical).digest('hex');
+}
+
+/**
+ * Recompute the live descriptor hash and compare it to the wrap-time pin.
+ * Returns a refusal when the server (or anyone holding the original object)
+ * mutated the descriptor after wrapping.
+ */
+function checkDescriptorPin(
+  entry: WrappedMCPTool,
+  live: MCPToolLike,
+): GuardResult | undefined {
+  if (hashDescriptor(live) === entry.descriptorHash) return undefined;
+  return {
+    safe: false,
+    blockedBy: 'DESCRIPTOR_PIN_VIOLATION',
+    reason:
+      `MCP descriptor for "${entry.name}" changed since wrap ` +
+      `(pinned ${entry.descriptorHash.slice(0, 12)}…) — possible rug pull, refusing`,
+  };
 }
 
 export interface VarkMCPAdapterOptions {
@@ -105,7 +142,7 @@ export class VarkMCPAdapter {
    * @param executor          per-call override for the MCP server round trip
    */
   wrapTools(
-    mcpTools: any[],
+    mcpTools: unknown[],
     defaultCapabilities?: CapabilityConfig,
     executor?: MCPExecutor,
   ): WrappedMCPTool[] {
@@ -121,12 +158,12 @@ export class VarkMCPAdapter {
       const inputSchema = tool.inputSchema ?? tool.schema ?? {};
       const capabilities: CapabilityConfig = { ...(defaultCapabilities ?? {}) };
 
-      const guard = this.runtime.tool<any, unknown>({
+      const guard = this.runtime.tool<Record<string, unknown>, unknown>({
         name: tool.name,
         description: tool.description ?? '',
         schema: inputSchema,
         capabilities,
-        run: async (args: any, context: ExecutionContext) => {
+        run: async (args: Record<string, unknown>, context: ExecutionContext) => {
           if (!dispatch) {
             throw new VarkError(
               'EXECUTION_ERROR',
@@ -141,12 +178,40 @@ export class VarkMCPAdapter {
         name: tool.name,
         description: tool.description ?? '',
         inputSchema,
+        descriptorHash: hashDescriptor(tool),
         capabilities: guard.capabilities,
         compact: guard.compact,
         compression: guard.compression,
-        check: (args?: unknown, options?: ExecutionOptions): GuardResult =>
-          this.runtime.check(tool.name, args, options),
-        execute: (args?: unknown, options?: ExecutionOptions) => guard.execute(args, options),
+        check: (args?: unknown, options?: ExecutionOptions): GuardResult => {
+          const pin = checkDescriptorPin(entry, tool);
+          if (pin) return pin;
+          return this.runtime.check(tool.name, args, options);
+        },
+        execute: async (args?: unknown, options?: ExecutionOptions) => {
+          const pin = checkDescriptorPin(entry, tool);
+          if (pin) {
+            const sessionId = options?.sessionId ?? this.runtime.session ?? DEFAULT_SESSION;
+            const message = pin.reason ?? 'MCP descriptor changed since wrap';
+            // Audited here because the guard pipeline is never reached.
+            this.runtime.audit.append({
+              sessionId,
+              tool: tool.name,
+              decision: 'DESCRIPTOR_PIN_VIOLATION',
+              blockedBy: 'DESCRIPTOR_PIN_VIOLATION',
+              reason: message,
+              sanitizedInputs: args,
+              executionTimeMs: 0,
+            });
+            return {
+              success: false,
+              blockedBy: 'DESCRIPTOR_PIN_VIOLATION',
+              error: message,
+              executionTimeMs: 0,
+              sessionId,
+            };
+          }
+          return guard.execute(args, options);
+        },
       };
 
       this.#tools.set(entry.name, entry);
@@ -178,7 +243,7 @@ export class VarkMCPAdapter {
 
 /** Functional shorthand for `new VarkMCPAdapter(options).wrapTools(...)`. */
 export function wrapMCPTools(
-  mcpTools: any[],
+  mcpTools: unknown[],
   defaultCapabilities?: CapabilityConfig,
   options: VarkMCPAdapterOptions = {},
 ): WrappedMCPTool[] {

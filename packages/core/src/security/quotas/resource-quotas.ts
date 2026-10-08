@@ -29,8 +29,18 @@ export interface QuotaStatus {
 export interface QuotaCheckResult {
   allowed: boolean;
   reason?: string;
+  /** Machine-readable refusal code. Present exactly when `allowed` is false. */
+  code?: QuotaCode;
   status: QuotaStatus;
 }
+
+/** Machine-readable quota refusal codes for SIEM routing and alerting. */
+export type QuotaCode =
+  | 'QUOTA_CPU_TIME'
+  | 'QUOTA_MEMORY'
+  | 'QUOTA_SUBPROCESS'
+  | 'QUOTA_FILE_DESCRIPTORS'
+  | 'QUOTA_OUTPUT';
 
 const DEFAULT_MAX_CPU_TIME_MS = 5_000;
 const DEFAULT_MAX_MEMORY_BYTES = 268_435_456; // 256 MB
@@ -89,6 +99,7 @@ export class ResourceQuota {
     if (status.cpuTimeMs > this.#config.maxCpuTimeMs) {
       return {
         allowed: false,
+        code: 'QUOTA_CPU_TIME',
         reason: `CPU time quota exceeded: ${status.cpuTimeMs}ms > ${this.#config.maxCpuTimeMs}ms`,
         status,
       };
@@ -103,6 +114,7 @@ export class ResourceQuota {
     if (status.memoryBytes > this.#config.maxMemoryBytes) {
       return {
         allowed: false,
+        code: 'QUOTA_MEMORY',
         reason: `Memory quota exceeded: ${status.memoryBytes} > ${this.#config.maxMemoryBytes} bytes`,
         status,
       };
@@ -117,6 +129,7 @@ export class ResourceQuota {
     if (status.subprocesses > this.#config.maxSubprocesses) {
       return {
         allowed: false,
+        code: 'QUOTA_SUBPROCESS',
         reason: `Subprocess quota exceeded: ${status.subprocesses} > ${this.#config.maxSubprocesses}`,
         status,
       };
@@ -131,6 +144,7 @@ export class ResourceQuota {
     if (status.fileDescriptors > this.#config.maxFileDescriptors) {
       return {
         allowed: false,
+        code: 'QUOTA_FILE_DESCRIPTORS',
         reason: `File descriptor quota exceeded: ${status.fileDescriptors} > ${this.#config.maxFileDescriptors}`,
         status,
       };
@@ -145,6 +159,7 @@ export class ResourceQuota {
     if (status.outputBytes > this.#config.maxOutputBytes) {
       return {
         allowed: false,
+        code: 'QUOTA_OUTPUT',
         reason: `Output size quota exceeded: ${status.outputBytes} > ${this.#config.maxOutputBytes} bytes`,
         status,
       };

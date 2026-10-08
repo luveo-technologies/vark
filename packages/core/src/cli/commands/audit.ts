@@ -177,6 +177,52 @@ export async function loadEntries(logPath: string): Promise<AuditEntry[]> {
 export interface TailOptions {
   lines?: number;
   follow?: boolean;
+  /**
+   * Print a prominent alert line for security-relevant refusals
+   * (injection, capability violations, freezes, …) as they stream in.
+   */
+  alert?: boolean;
+  /** Webhook to POST alert entries to. Defaults to `$VARK_SIEM_WEBHOOK_URL`. */
+  webhook?: string;
+}
+
+/** Decisions loud enough to warrant an operator alert while tailing. */
+const ALERTABLE: ReadonlySet<string> = new Set([
+  'CIRCUIT_BREAKER',
+  'CAPABILITY_VIOLATION',
+  'INDIRECT_INJECTION',
+  'VELOCITY_EXCEEDED',
+  'BUDGET_EXCEEDED',
+  'SESSION_FROZEN',
+  'DESCRIPTOR_PIN_VIOLATION',
+  'HITL_DENIED',
+  'LOOP_BLOCKED',
+  'TIMEOUT',
+]);
+
+/** Whether an entry deserves an alert line (refusal of a security gate). */
+export function isAlertable(entry: AuditEntry): boolean {
+  return entry.decision !== 'ALLOWED' && ALERTABLE.has(entry.decision);
+}
+
+/**
+ * Print (and optionally webhook) an alert for a security-relevant entry.
+ * The webhook POST is fire-and-forget: a dead endpoint must never break
+ * the tail loop.
+ */
+export function emitAlert(entry: AuditEntry, webhook?: string): void {
+  const url = webhook ?? process.env['VARK_SIEM_WEBHOOK_URL'];
+  console.log(
+    `  ${red('⚠ ALERT')} ${bold(entry.decision)} ${bold(entry.tool)} ` +
+      `${dim(entry.sessionId)} — ${(entry.reason ?? 'refused').slice(0, 120)}`,
+  );
+  if (url) {
+    void fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ type: 'threat', severity: 'warning', payload: entry }),
+    }).catch(() => undefined);
+  }
 }
 
 function formatEntry(entry: AuditEntry): string {
@@ -194,7 +240,10 @@ export async function runTail(logPath: string, options: TailOptions = {}): Promi
   const path = resolve(logPath);
   const entries = await loadEntries(path);
   const tailCount = options.lines ?? 10;
-  for (const entry of entries.slice(-tailCount)) console.log(formatEntry(entry));
+  for (const entry of entries.slice(-tailCount)) {
+    console.log(formatEntry(entry));
+    if (options.alert && isAlertable(entry)) emitAlert(entry, options.webhook);
+  }
   if (!options.follow) return;
 
   console.log(dim(`  ── following ${path} (Ctrl+C to exit) ──`));
@@ -210,7 +259,10 @@ export async function runTail(logPath: string, options: TailOptions = {}): Promi
     for await (const _event of watcher) {
       void _event;
       const fresh = await loadEntries(path);
-      for (const entry of fresh.slice(size)) console.log(formatEntry(entry));
+      for (const entry of fresh.slice(size)) {
+        console.log(formatEntry(entry));
+        if (options.alert && isAlertable(entry)) emitAlert(entry, options.webhook);
+      }
       size = fresh.length;
     }
   } finally {
@@ -221,14 +273,23 @@ export async function runTail(logPath: string, options: TailOptions = {}): Promi
 // ── export ──────────────────────────────────────────────────────────────────
 
 /** Export formats for `vark audit export`. */
-export type ExportFormat = 'json' | 'csv' | 'html';
+export type ExportFormat = 'json' | 'csv' | 'html' | 'ndjson';
+
+/** Minimal CSV escaping: quote fields containing commas, quotes or newlines. */
+function csvCell(value: unknown): string {
+  const text = value === undefined || value === null ? '' : String(value);
+  return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
 
 export function exportAudit(entries: AuditEntry[], format: ExportFormat): string {
   if (format === 'json') {
     return JSON.stringify(entries, null, 2);
   }
+  if (format === 'ndjson') {
+    return entries.map((e) => JSON.stringify(e)).join('\n');
+  }
   if (format === 'csv') {
-    const header = 'seq,timestamp,session,tool,decision,blockedBy,ms,inspectMs,redactedIn,redactedOut,injectionStripped,tokensSaved,hash';
+    const header = 'seq,timestamp,session,tool,decision,blockedBy,reason,ms,inspectMs,redactedIn,redactedOut,injectionStripped,tokensSaved,findings,prevHash,hash,sanitizedInputs';
     const rows = entries.map((e) =>
       [
         e.seq,
@@ -237,14 +298,20 @@ export function exportAudit(entries: AuditEntry[], format: ExportFormat): string
         e.tool,
         e.decision,
         e.blockedBy ?? '',
+        e.reason ?? '',
         e.executionTimeMs,
         e.inspectionMs,
         e.inputRedactions,
         e.outputRedactions,
         e.injectionSanitized,
         e.tokensSaved,
-        e.hash.slice(0, 12),
-      ].join(','),
+        (e.findings ?? []).join('|'),
+        e.prevHash,
+        e.hash,
+        JSON.stringify(e.sanitizedInputs ?? null),
+      ]
+        .map(csvCell)
+        .join(','),
     );
     return [header, ...rows].join('\n');
   }

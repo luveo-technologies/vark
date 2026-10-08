@@ -26,7 +26,9 @@ import { analyzeCompression, estimateTokens } from './compressor.js';
 import type { CompressionReport } from './compressor.js';
 import { redactValue } from './dlp.js';
 import { sanitizeIndirectInjection } from './indirect-injection.js';
-import { coerceValue, validateSchema } from './schema-validator.js';
+import { coerceValueDeep, validateSchema } from './schema-validator.js';
+import { applyEnvOverrides } from './env-config.js';
+import { resolveIsolationMode } from './isolated-vm.js';
 import { DEFAULT_MAX_EXECUTION_MS, createSandbox, inspectArguments, withTimeout } from './sandbox.js';
 import type {
   AnomalyGuardConfig,
@@ -38,6 +40,7 @@ import type {
   ExecutionOptions,
   GateDecision,
   GuardResult,
+  HitlRuntimeConfig,
   IndirectInjectionConfig,
   InspectionResult,
   IsolationMode,
@@ -50,15 +53,18 @@ import { VarkError } from './types.js';
 
 /**
  * Map an anomaly-guard refusal cause onto the public refusal code.
- * Loops refuse just the call; velocity/budget halts refuse the session.
+ * Loops refuse just the call; velocity/budget halts and admin freezes
+ * refuse the session.
  */
 function anomalyBlockedBy(cause: AnomalyCause | undefined): BlockedBy {
   if (cause === 'velocity') return 'VELOCITY_EXCEEDED';
   if (cause === 'budget') return 'BUDGET_EXCEEDED';
+  if (cause === 'frozen') return 'SESSION_FROZEN';
   return 'LOOP_BLOCKED';
 }
 
 /** A tool after it has been registered and armed with vark guards. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- public generic default: `unknown` would break contextual inference for `run: (args) => args.path`. Pass explicit type arguments to narrow.
 export interface WrappedTool<TArgs = any, TResult = any> {
   definition: ToolDefinition<TArgs, TResult>;
   /** Merged grants: `defaultCapabilities` ← `definition.capabilities`. */
@@ -81,6 +87,7 @@ export interface ResolvedVarkConfig {
   anomaly: AnomalyGuardConfig;
   audit: AuditLoggerConfig;
   schema: SchemaValidationConfig;
+  hitl?: HitlRuntimeConfig;
 }
 
 export const DEFAULT_SESSION = 'default';
@@ -93,22 +100,26 @@ export class VarkRuntime {
   readonly anomaly: AnomalyGuard;
 
   #session: string;
-  readonly #tools = new Map<string, WrappedTool<any, any>>();
+  #isolationWarned = false;
+  readonly #tools = new Map<string, WrappedTool>();
 
   constructor(config: VarkConfig = {}) {
+    // Env vars fill only what the programmatic config left unset.
+    const cfg = applyEnvOverrides(config);
     this.config = {
-      isolation: config.isolation ?? 'process',
-      circuitBreaker: config.circuitBreaker ?? {},
-      defaultCapabilities: config.defaultCapabilities ?? {},
-      dlp: config.dlp ?? {},
-      indirectInjection: config.indirectInjection ?? {},
-      anomaly: config.anomaly ?? {},
-      audit: config.audit ?? {},
-      schema: config.schema ?? {},
+      isolation: cfg.isolation ?? 'process',
+      circuitBreaker: cfg.circuitBreaker ?? {},
+      defaultCapabilities: cfg.defaultCapabilities ?? {},
+      dlp: cfg.dlp ?? {},
+      indirectInjection: cfg.indirectInjection ?? {},
+      anomaly: cfg.anomaly ?? {},
+      audit: cfg.audit ?? {},
+      schema: cfg.schema ?? {},
+      ...(cfg.hitl ? { hitl: cfg.hitl } : {}),
     };
     this.audit = new AuditLogger(this.config.audit);
     this.anomaly = new AnomalyGuard(this.config.anomaly);
-    this.#session = config.sessionId ?? DEFAULT_SESSION;
+    this.#session = cfg.sessionId ?? DEFAULT_SESSION;
     this.#warmup();
   }
 
@@ -130,6 +141,7 @@ export class VarkRuntime {
   }
 
   /** Register a tool. Throws when the name is already taken. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mirrors ToolDefinition's inference-friendly defaults
   register<TArgs = any, TResult = any>(
     definition: ToolDefinition<TArgs, TResult>,
   ): WrappedTool<TArgs, TResult> {
@@ -156,11 +168,12 @@ export class VarkRuntime {
         this.#run(definition, capabilities, args, options),
     };
 
-    this.#tools.set(definition.name, wrapped as WrappedTool<any, any>);
+    this.#tools.set(definition.name, wrapped as WrappedTool);
     return wrapped;
   }
 
   /** Alias of {@link register} — register and get the guarded wrapper back. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mirrors ToolDefinition's inference-friendly defaults
   tool<TArgs = any, TResult = any>(
     definition: ToolDefinition<TArgs, TResult>,
   ): WrappedTool<TArgs, TResult> {
@@ -168,6 +181,7 @@ export class VarkRuntime {
   }
 
   /** Register a tool and return only its guarded callable. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mirrors ToolDefinition's inference-friendly defaults
   wrap<TArgs = any, TResult = any>(
     definition: ToolDefinition<TArgs, TResult>,
   ): (args?: unknown, options?: ExecutionOptions) => Promise<ToolExecutionResult<TResult>> {
@@ -184,9 +198,18 @@ export class VarkRuntime {
     this.#session = sessionId;
   }
 
-  /** Clear loop/velocity state for one session, or for all sessions. */
+  /** Clear loop/velocity state for one session, or for all sessions. Also unfreezes. */
   resetSession(sessionId?: string): void {
     this.anomaly.reset(sessionId);
+  }
+
+  /**
+   * Administratively lock a session: every later call is refused with
+   * `SESSION_FROZEN` until `resetSession()` clears it. Returns false when
+   * the session does not exist.
+   */
+  freezeSession(sessionId: string, reason?: string): boolean {
+    return this.anomaly.freeze(sessionId, reason);
   }
 
   /** Run the guard pipeline without executing. Useful as a pre-flight check. */
@@ -217,6 +240,7 @@ export class VarkRuntime {
   }
 
   /** Execute a registered tool through the full pipeline. Never throws. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- result type is deliberately permissive; narrow with `execute<MyResult>(...)`
   execute<T = any>(
     name: string,
     args?: unknown,
@@ -253,11 +277,11 @@ export class VarkRuntime {
     return this.#tools.has(name);
   }
 
-  get(name: string): WrappedTool<any, any> | undefined {
+  get(name: string): WrappedTool | undefined {
     return this.#tools.get(name);
   }
 
-  list(): Array<WrappedTool<any, any>> {
+  list(): Array<WrappedTool> {
     return [...this.#tools.values()];
   }
 
@@ -374,7 +398,7 @@ export class VarkRuntime {
     if (schemaConfig.enabled !== false && schemaConfig.validateArgs !== false) {
       let validatedArgs = args;
       if (schemaConfig.strict !== true) {
-        const coerced = coerceValue(args, definition.schema);
+        const coerced = coerceValueDeep(args, definition.schema);
         if (coerced.coerced) validatedArgs = coerced.value;
       }
       const verdict = validateSchema(validatedArgs, definition.schema);
@@ -401,6 +425,43 @@ export class VarkRuntime {
     }
 
     // ── 5. Execution ────────────────────────────────────────────────────
+    // Never silently claim isolation we don't provide: the first execute()
+    // under isolation:'wasm' resolves availability once and states exactly
+    // what gate 5 does (in-process + capability sandbox + wall-clock timeout)
+    // and where true isolate execution lives.
+    if (this.config.isolation === 'wasm' && !this.#isolationWarned) {
+      this.#isolationWarned = true;
+      const resolved = await resolveIsolationMode('wasm');
+      console.warn(
+        `vark: ${resolved.warning ??
+          "isolation:'wasm' — gate 5 runs tool bodies in-process (closures need module scope); " +
+          'use executeInSandbox()/executeIsolated() for true isolate execution of self-contained tools.'}`,
+      );
+    }
+
+    // ── 4b. Human-in-the-loop approval (only for mapped high-risk tools) ──
+    const hitlCapability = this.config.hitl?.tools[tool];
+    if (hitlCapability && this.config.hitl) {
+      const approval = await this.config.hitl.gate.requestApproval(
+        hitlCapability,
+        sessionId,
+        tool,
+        sanitizedInputs,
+        { timeoutMs: this.config.hitl.timeoutMs ?? 60_000 },
+      );
+      if (!approval.approved) {
+        flag('HITL_DENIED');
+        const message =
+          `high-risk capability "${hitlCapability}" ` +
+          (approval.decidedBy === 'system'
+            ? 'timed out awaiting approval'
+            : `denied by ${approval.decidedBy}`) +
+          (approval.reason ? `: ${approval.reason}` : '');
+        note(message);
+        return commit(refusal('HITL_DENIED', message));
+      }
+    }
+
     let data: TResult;
     try {
       data = await withTimeout(
@@ -435,7 +496,11 @@ export class VarkRuntime {
         flag('INDIRECT_INJECTION');
         note(scan.reasons.join('; '));
         if (injection.mode === 'block') {
-          return commit(refusal('INDIRECT_INJECTION', reason ?? 'indirect prompt injection detected'));
+          const message = reason ?? 'indirect prompt injection detected';
+          if (this.config.anomaly.freezeOnInjectionBlock === true) {
+            this.anomaly.freeze(sessionId, message);
+          }
+          return commit(refusal('INDIRECT_INJECTION', message));
         }
         injectionSanitized = scan.removed;
         data = scan.value as TResult;

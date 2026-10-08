@@ -234,7 +234,7 @@ or lets the call through.
 
 ### Gate 1 — Anomaly Guard
 
-**File:** `anomaly-guard.ts` · **Config:** `VarkConfig.anomaly` · **Refusals:** `LOOP_BLOCKED` (identical-call loop) · `VELOCITY_EXCEEDED` (rate halt) · `BUDGET_EXCEEDED` (budget halt)
+**File:** `anomaly-guard.ts` · **Config:** `VarkConfig.anomaly` · **Refusals:** `LOOP_BLOCKED` (identical-call loop) · `VELOCITY_EXCEEDED` (rate halt) · `BUDGET_EXCEEDED` (budget halt) · `SESSION_FROZEN` (administrative lock)
 
 Stateful, per-session window that stops runaway execution before anything else
 happens.
@@ -245,6 +245,8 @@ happens.
 | Calls in sliding window | `maxCallsPerMinute: 30` / `windowMs: 60_000` | **Halt the session** |
 | Lifetime call budget | `maxTotalCalls: 1_000` | **Halt the session** |
 | Lifetime token budget | `maxSessionTokens: 250_000` | **Halt the session** |
+| Frozen session | `freeze()` / `freezeOnInjectionBlock` | **Refuse everything** until `resetSession()` |
+| Idle TTL | `sessionTTLMs: 0` (off) | `sweepExpired()` evicts idle sessions (halted/frozen kept) |
 
 ```ts
 const runtime = new VarkRuntime({ anomaly: { maxIdenticalCalls: 3, maxCallsPerMinute: 30 } });
@@ -259,7 +261,7 @@ for (let i = 0; i < 4; i += 1) {
 
 runtime.anomaly.stats('agent-7');
 // { sessionId: 'agent-7', totalCalls: 4, callsInWindow: 4, identicalCalls: 4,
-//   tokens: 122, halted: false, haltReason: '' }
+//   tokens: 122, halted: false, haltReason: '', frozen: false, frozenReason: '' }
 ```
 
 **Fingerprinting** uses `callFingerprint(tool, args)` → `tool(stableStringify(args))`.
@@ -267,16 +269,28 @@ runtime.anomaly.stats('agent-7');
 are the *same* call.
 
 **Halted sessions.** Velocity/budget violations set `halted: true` and every
-later call in that session is refused with `LOOP_BLOCKED` and the original
-reason. Vark deliberately does **not** call `process.exit()` — a security guard
+later call in that session is refused with the code matching the original
+cause (`VELOCITY_EXCEEDED` or `BUDGET_EXCEEDED`) and the original reason.
+Vark deliberately does **not** call `process.exit()` — a security guard
 must not crash its host; a halted session leaves you a live process and a
 readable audit trail. Clear a session with `runtime.resetSession(id)`.
 
-> **One gate, three codes (since 0.1.2).** Identical-call loops,
-> velocity breaches, and budget exhaustion surface as `LOOP_BLOCKED`,
-> `VELOCITY_EXCEEDED`, and `BUDGET_EXCEEDED` respectively — 0.1.0/0.1.2
-> reported all three as `LOOP_BLOCKED`. The `reason` string always names the
-> specific cause, and the audit entry records it verbatim.
+**Frozen sessions (since 0.2.0).** `runtime.freezeSession(id, reason)`
+administratively locks a session — every later call is refused with
+`SESSION_FROZEN` until `resetSession()` clears it; `anomaly.unfreeze(id)`
+lifts the lock without wiping counters. With
+`anomaly.freezeOnInjectionBlock: true`, a gate-7 block in `mode: 'block'`
+freezes the session automatically. Frozen refusals never consume call
+slots. `anomaly.sessionTTLMs` + `anomaly.sweepExpired()` evict sessions
+idle longer than the TTL — halted and frozen sessions are always retained
+(evicting them would silently resurrect a stopped agent).
+
+> **One gate, four codes (since 0.1.2/0.2.0).** Identical-call loops,
+> velocity breaches, budget exhaustion, and administrative freezes surface
+> as `LOOP_BLOCKED`, `VELOCITY_EXCEEDED`, `BUDGET_EXCEEDED`, and
+> `SESSION_FROZEN` respectively — 0.1.0 reported the first three all as
+> `LOOP_BLOCKED`. The `reason` string always names the specific cause, and
+> the audit entry records it verbatim.
 
 **Attempt accounting.** `record()` charges *every* attempt (even refused ones),
 so an attacker cannot reset a velocity limit by making blocked calls. Input
@@ -390,9 +404,17 @@ visual-spoofing obfuscation cannot hide a signature — full-width `ｒｍ －�
 trips `rm-rf` exactly like its ASCII twin. Hits on the canonical form are
 annotated `(normalized input)` in the reason. Pure-ASCII payloads skip the
 second pass via a fast-path check, keeping the sub-ms budget. Custom rules
-always receive the raw value. Deep multi-layer decoding (URL/base64/hex/HTML)
-is intentionally *not* part of this gate — it lives in `vark scan`, where a
-human reviews the decoded variants instead of blocking on them.
+always receive the raw value.
+
+**Strict decoding (since 0.2.0).** A third pass scans strictly-decoded
+variants (`decodeEncodedLayers`): percent-encoding, HTML entities, hex,
+base64, and nested chains up to 5 layers deep, so `cm0gLXJmIC8=`,
+`726d202d7266202f` and `run %72m%20-rf%20/` are refused with decode
+provenance in the reason (`(decoded base64→hex)`). Admission is strict —
+only strings with explicit encoding markers are decoded, and only
+text-like results (≥ 70 % printable) are scanned — so opaque tokens (git
+SHAs, UUIDs, session ids) can never trip the pass. `vark scan` still shows
+the *aggressive* `decodeAllLayers` variants for human review.
 
 ### Gate 4 — Input DLP
 
@@ -416,6 +438,9 @@ later matches are skipped):
 | 8 | `STRIPE_KEY` | `sk_live_…` / `rk_test_…` |
 | 9 | `BEARER_TOKEN` | `Authorization: Bearer …` |
 | 10 | `ENV_CREDENTIAL` | `API_KEY=`/`SECRET=`/`PASSWORD=`/`TOKEN=`… value pairs |
+| 11 | `CREDIT_CARD` | 13–19 digit card numbers, **Luhn-validated** (no false hits on digit runs) |
+| 12 | `SSN` | `###-##-####` |
+| 13 | `HIGH_ENTROPY_SECRET` | Opaque tokens ≥ 32 chars with Shannon entropy ≥ 4.5 bits/char (private-key bodies, API secrets) |
 
 Priority is what makes this correct rather than merely aggressive:
 
@@ -448,11 +473,22 @@ data = await withTimeout(
   timeout wins, so a late rejection can never surface as an unhandled
   rejection.
 - **Isolation modes:** `'process'` (default), `'mock'`, and `'wasm'`.
-  `'wasm'` is **reserved** for a future isolate backend and currently behaves
-  as `'process'` — see [§10](#10-limitations--faq).
+  Gate 5 always executes `run()` in-process — closures need module scope and
+  `ctx.sandbox` carries live functions that cannot cross an isolate
+  boundary — so `'wasm'` configures the *standalone* isolate APIs
+  (`executeInSandbox()`, `executeIsolated()`, `resolveIsolationMode()`).
+  When the runtime is configured with `'wasm'` it warns **once** at the
+  first `execute()` stating exactly this and whether `isolated-vm` is
+  available; nothing degrades silently. See [§10](#10-limitations--faq).
 - Any exception thrown by `run()` is caught and converted to
   `blockedBy: 'EXECUTION_ERROR'` (or the gate of the vark error that was
   thrown, e.g. a `CapabilityViolationError` raised inside `ctx.sandbox`).
+- **Human-in-the-loop (since 0.2.0).** When `VarkConfig.hitl` maps a tool
+  name to a capability, gate 5 pauses before `run()` and awaits
+  `hitl.gate.requestApproval(...)`. Denials refuse with
+  `blockedBy: 'HITL_DENIED'`; undecided requests expire into denials after
+  `hitl.timeoutMs` (default 60 s) — fail-closed, with the pending timer
+  always cleared.
 
 ### Gate 6 — Output DLP
 
@@ -555,14 +591,21 @@ const runtime = new VarkRuntime({ /* VarkConfig */ });
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `isolation` | `'process' \| 'wasm' \| 'mock'` | `'process'` | Isolation backend for `run()`. `'wasm'` is reserved (behaves as `'process'`) |
+| `isolation` | `'process' \| 'wasm' \| 'mock'` | `'process'` | Requested isolation backend; `'wasm'` drives the standalone isolate APIs and warns once at first execute (§10) |
+| `isolationConfig` | `IsolationConfig` | `{}` | Memory ceiling / fallback policy for the isolate APIs |
 | `circuitBreaker` | `CircuitBreakerConfig` | `{}` | See §4.5 |
 | `defaultCapabilities` | `CapabilityConfig` | `{}` | Grants merged under every tool |
 | `dlp` | `DlpConfig` | `{}` (enabled, `redact`) | See §4.6 |
 | `indirectInjection` | `IndirectInjectionConfig` | `{}` (enabled, `sanitize`) | See §4.7 |
 | `anomaly` | `AnomalyGuardConfig` | `{}` (all defaults in §4.8) | See §4.8 |
 | `audit` | `AuditLoggerConfig` | `{}` (enabled, 10 000 entries) | See §4.9 |
+| `schema` | `SchemaValidationConfig` | `{}` (enabled, coercing) | Runtime JSON-Schema gate |
+| `hitl` | `HitlRuntimeConfig` | — | Human-in-the-loop: `{ gate, tools, timeoutMs? }` (§3 gate 5) |
 | `sessionId` | `string` | `'default'` (`DEFAULT_SESSION`) | Initial agent session |
+
+`VARK_*` environment variables fill any field the config leaves unset
+(explicit config wins; invalid values are ignored) — see
+[CONFIGURATION.md](CONFIGURATION.md#environment-variables).
 
 ```ts
 const runtime = new VarkRuntime({
@@ -592,7 +635,8 @@ The resolved configuration is available as `runtime.config` (`ResolvedVarkConfig
 | `runtime.anomaly` | `readonly AnomalyGuard` | Per-session loop/velocity state (§4.8) |
 | `runtime.session` | `get string` | Current default session id |
 | `runtime.setSession(id)` | method | Switch the default session |
-| `runtime.resetSession(id?)` | method | Clear one session (or all) from the anomaly guard |
+| `runtime.resetSession(id?)` | method | Clear one session (or all) from the anomaly guard; also unfreezes |
+| `runtime.freezeSession(id, reason?)` | method | Administratively lock a session (`SESSION_FROZEN` until reset); `false` if unknown |
 
 #### Registration
 
@@ -669,6 +713,7 @@ await runtime.execute('read_file', { path: './a.json' }, { sessionId: 'agent-7' 
 'CIRCUIT_BREAKER' | 'CAPABILITY_VIOLATION' | 'TIMEOUT' | 'EXECUTION_ERROR'
 | 'DLP_REDACTED' | 'INDIRECT_INJECTION' | 'LOOP_BLOCKED'
 | 'VELOCITY_EXCEEDED' | 'BUDGET_EXCEEDED'
+| 'DESCRIPTOR_PIN_VIOLATION' | 'SESSION_FROZEN' | 'HITL_DENIED'
 ```
 
 `GateDecision` (audit only) additionally includes `'ALLOWED'`.
@@ -815,7 +860,7 @@ stableStringify(value);                        // canonical JSON (sorted keys, c
 | `timestamp` | `string` | ISO-8601 |
 | `sessionId` | `string` | Agent session |
 | `tool` | `string` | Tool name |
-| `decision` | `GateDecision` | `ALLOWED` · `CIRCUIT_BREAKER` · `CAPABILITY_VIOLATION` · `DLP_REDACTED` · `INDIRECT_INJECTION` · `LOOP_BLOCKED` · `VELOCITY_EXCEEDED` · `BUDGET_EXCEEDED` · `TIMEOUT` · `EXECUTION_ERROR` |
+| `decision` | `GateDecision` | `ALLOWED` · `CIRCUIT_BREAKER` · `CAPABILITY_VIOLATION` · `DLP_REDACTED` · `INDIRECT_INJECTION` · `LOOP_BLOCKED` · `VELOCITY_EXCEEDED` · `BUDGET_EXCEEDED` · `DESCRIPTOR_PIN_VIOLATION` · `SESSION_FROZEN` · `HITL_DENIED` · `TIMEOUT` · `EXECUTION_ERROR` |
 | `blockedBy` | `BlockedBy?` | Present only for refusals |
 | `reason` | `string?` | Human-readable reason (incl. injection findings) |
 | `sanitizedInputs` | `unknown` | Arguments **after input DLP** — never the raw secrets |
@@ -848,41 +893,91 @@ Thrown **inside** `run()` / the sandbox (never out of `execute()`):
 ### 4.11 Complete export surface
 
 ```ts
-// runtime
-VarkRuntime, DEFAULT_SESSION
+// runtime & configuration
+VarkRuntime, DEFAULT_SESSION, applyEnvOverrides
 type ResolvedVarkConfig, WrappedTool
 
 // circuit breaker
-inspectPayload, inspect, benchmarkInspection          type InspectionBenchmark
+inspectPayload, inspect, benchmarkInspection            type InspectionBenchmark
 
 // CTP
-compressSchema, analyzeCompression, estimateTokens    type CompressionReport
+compressSchema, analyzeCompression, estimateTokens      type CompressionReport
 
-// DLP
-redactText, redactValue, scanSecrets                  type DlpMatch, DlpScanResult, DlpValueResult
+// schema gate
+validateSchema, coerceValue, coerceValueDeep            type SchemaValidationResult
+
+// DLP (secret redaction)
+redactText, redactValue, scanSecrets, redactBuffer, luhnCheck, shannonEntropy,
+HIGH_ENTROPY_THRESHOLD, HIGH_ENTROPY_MIN_LENGTH
+type DlpMatch, DlpScanResult, DlpValueResult, ExtendedDlpResult
+scanValueSync, scanValueAsync, extractTextSurfaces      // deep-value DLP walk
 
 // indirect injection
-scanIndirectInjection, sanitizeIndirectInjection, INJECTION_MARKER
+scanIndirectInjection, sanitizeIndirectInjection, addInjectionReference,
+INJECTION_MARKER
 type InjectionFinding, InjectionScanResult, InjectionValueResult
+scanSemanticInjection, computeEmbedding                 // semantic layer
 
-// anomaly guard
-AnomalyGuard, callFingerprint                          type AnomalySessionStats, AnomalyVerdict
+// normalization & decoding (gate 3 passes, vark scan)
+normalizeInput, normalizeForScan, normalizeAndDecode, decodeAllLayers,
+decodeEncodedLayers, decodeHtmlEntities, decodeUrlEncoding, decodeHexEncoding
+type NormalizerConfig, DecodedVariant
 
-// audit
-AuditLogger, GENESIS_HASH, stableStringify             type AuditAppendInput, AuditVerifyResult
+// anomaly guard (gate 1)
+AnomalyGuard, callFingerprint
+type AnomalySessionStats, AnomalyVerdict, AnomalyCause
 
-// sandbox
-DEFAULT_MAX_EXECUTION_MS, createSandbox, inspectArguments,
+// audit (gate 8)
+AuditLogger, GENESIS_HASH, stableStringify, verifyAuditEntry, generateAuditKeyPair,
+KmsAuditSigner, FileAuditSink, StreamAuditSink, MultiAuditSink, createDefaultAuditSink
+type AuditAppendInput, AuditVerifyResult, AuditSink, AuditSinkOptions
+
+// execution & isolation (gate 5)
+DEFAULT_MAX_EXECUTION_MS, createSandbox, inspectArguments, withTimeout,
+executeInSandbox, createSandboxedFunction, executeIsolated, resolveIsolationMode,
+isTrueIsolationAvailable, DEFAULT_ISOLATE_MEMORY_LIMIT_MB
+type IsolateConfig, IsolateResult
+
+// network / path / shell hardening (gate 2 helpers)
+checkSsrf, checkRedirect, normalizeIp, matchWildcardDomain, isDomainAllowed,
+stripUrlCredentials, checkPathSecurity, containsNullByte, expandTilde,
+expandEnvVars, parseFileUri, isWithinRoots, validateWindowsPath, openFileSafe,
+verifyFileIdentity, validateBinary, validateArgs, execFileSafe,
+containsShellMetacharacters, sanitizeArgForDisplay,
 checkPathAllowed, checkHostAllowed, assertPathAllowed, assertNetworkAllowed,
-normalizePath, withTimeout
+normalizePath
 
-// types / errors
-type VarkConfig, CapabilityConfig, CircuitBreakerConfig, DlpConfig,
-      IndirectInjectionConfig, AnomalyGuardConfig, AuditLoggerConfig, AuditEntry,
-      ToolDefinition, ExecutionContext, ExecutionOptions, ToolExecutionResult,
-      GuardResult, InspectionResult, BlockedBy, GateDecision, IsolationMode
+// human-in-the-loop (gate 4b)
+HitlGate, DEFAULT_HITL_CAPABILITIES
+type HitlCapability, HitlRequest, HitlConfig, HitlDecision
+
+// enterprise modules
+ResourceQuota,                                            // subprocess/memory quotas
+PiiAnonymizer, createPiiAnonymizer,                       // reversible PII tokens
+DagFlowEnforcer, COMMON_DAG_PATTERNS,                     // dependency graphs
+EphemeralCredentialManager, InMemoryCredentialProvider,   // short-lived secrets
+EgressProxy, COMMON_EGRESS_RULES,                         // mTLS / pinned DNS
+ReplayEngine, DeterministicRandomSource, DeterministicTimeSource,  // replay proofs
+CanaryManager,                                            // honeytoken traps
+SiemBroadcaster, createWebhookSender,                     // telemetry
+EphemeralVfs, VfsSessionManager,                          // per-session VFS
+createEntropyScanner, scanEntropyAndReflection, calculateEntropy,
+jaccardSimilarity, cosineSimilarity, ngramCosineSimilarity  // reflection attacks
+
+// errors
 VarkError, CircuitBreakerError, CapabilityViolationError, VarkTimeoutError
+
+// types
+type VarkConfig, HitlRuntimeConfig, CapabilityConfig, CircuitBreakerConfig,
+      DlpConfig, IndirectInjectionConfig, AnomalyGuardConfig, AuditLoggerConfig,
+      AuditEntry, ToolDefinition, ExecutionContext, ExecutionOptions,
+      ToolExecutionResult, GuardResult, InspectionResult, BlockedBy,
+      GateDecision, IsolationMode
 ```
+
+`@luveo-tech/vark-mcp` exports `VarkMCPAdapter`, `wrapMCPTools`,
+`hashDescriptor` and types `MCPExecutor`, `MCPToolLike`,
+`VarkMCPAdapterOptions`, `WrappedMCPTool`, `ExecutionOptions`.
 
 ---
 
@@ -1018,10 +1113,20 @@ const tools = adapter.wrapTools(
 | Member | Description |
 | --- | --- |
 | `name` / `description` / `inputSchema` | Copied verbatim from the raw descriptor |
+| `descriptorHash` | SHA-256 pin of `{ name, description, inputSchema }` taken at wrap time |
 | `capabilities` | Effective (merged) grants |
 | `compact` / `compression` | CTP signature + token accounting |
-| `check(args?, options?)` | Dry run — gates 1–3, no server call |
+| `check(args?, options?)` | Dry run — gates 1–3 **plus the descriptor pin**, no server call |
 | `execute(args?, options?)` | Guarded execution → server round trip → sanitised result |
+
+**Rug-pull defense (since 0.2.0).** An MCP server (or anyone holding the
+original descriptor object) can mutate `name`/`description`/`inputSchema`
+mid-session — swapping an input schema after the model has already planned
+against the pinned one. Every `check()`/`execute()` recomputes the
+descriptor hash; a mismatch refuses the call with
+`blockedBy: 'DESCRIPTOR_PIN_VIOLATION'`, audits the event, and never
+reaches the server. Re-wrap (`wrapTools(...)`) to accept a new descriptor
+deliberately. `hashDescriptor(tool)` is exported for your own pinning.
 
 ```ts
 await tools[0].execute({ url: 'https://docs.example.com/intro' });  // ✅ ALLOWED
@@ -1355,16 +1460,25 @@ an attacker cannot reset a velocity limit by making refused calls.
 
 **Why doesn't a velocity violation kill the process?**
 Because a security guard must not crash its host. Vark halts the *session*:
-every later call is refused with `LOOP_BLOCKED`, while the process stays alive
+every later call is refused with the code matching the cause
+(`VELOCITY_EXCEEDED` or `BUDGET_EXCEEDED`), while the process stays alive
 for the operator and the audit trail.
 
 **Does `isolation: 'wasm'` give me WASM isolates?**
-Not yet. It is reserved and currently behaves as `'process'` (documented in
-`types.ts`).
+It configures the *standalone* isolate APIs — `executeInSandbox()`,
+`executeIsolated()`, `resolveIsolationMode()` — which run self-contained
+functions in a true V8 isolate when the optional `isolated-vm` native
+module is installed (and a restricted `node:vm` context otherwise).
+`VarkRuntime` gate 5 itself always executes `run()` in-process, because
+tool closures need module scope and `ctx.sandbox` carries live functions
+that cannot cross an isolate boundary; configuring the runtime with
+`'wasm'` therefore warns **once** at the first `execute()` stating exactly
+this. Nothing degrades silently.
 
 **Is `vark` published to npm?**
-Both packages are `0.1.2` workspace packages in this monorepo, consumed via
-`workspace:*`. The install commands in §2 apply once published.
+Yes — `@luveo-tech/vark` and `@luveo-tech/vark-mcp` are on npm (0.1.0 /
+0.1.1 published; this release is 0.2.0). Inside this monorepo the packages
+are consumed via `workspace:*`.
 
 ---
 

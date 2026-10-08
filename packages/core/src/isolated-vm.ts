@@ -8,6 +8,7 @@
  */
 
 import type { IsolationMode } from './types.js';
+import * as vm from 'node:vm';
 
 /** Memory ceiling for an isolated isolate (default 64 MB). */
 export const DEFAULT_ISOLATE_MEMORY_LIMIT_MB = 64;
@@ -125,9 +126,8 @@ async function executeWithNodeVm<TArgs extends unknown[], TResult>(
   args: TArgs,
   opts: { timeoutMs: number; startedAt: number },
 ): Promise<IsolateResult<TResult>> {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const vm = require('node:vm') as typeof import('node:vm');
-
+  // node:vm is imported statically at module top: require() does not exist
+  // in ESM and would throw ReferenceError here.
   const sandbox: Record<string, unknown> = {
     console: { log: () => undefined, error: () => undefined, warn: () => undefined },
     JSON,
@@ -185,15 +185,26 @@ export async function isTrueIsolationAvailable(): Promise<boolean> {
 
 /**
  * Resolve the effective isolation mode, accounting for availability.
+ *
+ * The fallback is never silent: when true isolation is requested but
+ * unavailable, `warning` explains exactly what the caller gets instead, so
+ * operators cannot mistake advisory in-process execution for a real boundary.
  */
 export async function resolveIsolationMode(
   requested: IsolationMode,
-): Promise<{ mode: IsolationMode; trueIsolation: boolean }> {
+): Promise<{ mode: IsolationMode; trueIsolation: boolean; warning?: string }> {
   if (requested === 'wasm') {
     const available = await isTrueIsolationAvailable();
     return available
       ? { mode: 'wasm', trueIsolation: true }
-      : { mode: 'process', trueIsolation: false };
+      : {
+          mode: 'process',
+          trueIsolation: false,
+          warning:
+            "isolation:'wasm' requested but isolated-vm is not installed — " +
+            'falling back to advisory in-process execution (no memory ceiling, ' +
+            'shared heap). Install isolated-vm or set isolationConfig.allowFallback: false to refuse instead.',
+        };
   }
   return { mode: requested, trueIsolation: false };
 }

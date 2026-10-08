@@ -7,7 +7,7 @@
 import { readFile } from 'node:fs/promises';
 import { extname, resolve } from 'node:path';
 import { VarkRuntime } from '../../runtime.js';
-import type { VarkConfig } from '../../types.js';
+import type { CapabilityConfig, VarkConfig } from '../../types.js';
 import pkg from 'picocolors';
 const { green, red, yellow, dim } = pkg;
 import { printBanner, printSummaryLine, progressBar } from '../ux.js';
@@ -18,8 +18,8 @@ export interface PolicyFile {
   tools?: Array<{
     name: string;
     description: string;
-    schema: Record<string, any>;
-    capabilities?: Record<string, any>;
+    schema: Record<string, unknown>;
+    capabilities?: CapabilityConfig;
     run: string; // Function body as string for testing
   }>;
   tests?: PolicyTest[];
@@ -101,7 +101,10 @@ async function loadPolicy(filePath: string): Promise<PolicyFile> {
   try {
     return JSON.parse(content) as PolicyFile;
   } catch (error) {
-    throw new Error(`Failed to parse ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
+    throw new Error(
+      `Failed to parse ${filePath}: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
   }
 }
 
