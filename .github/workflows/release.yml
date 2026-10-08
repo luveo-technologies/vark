@@ -1,0 +1,39 @@
+# Published assurance package for every version tag: the CycloneDX SBOM
+# (generated fresh from the tagged tree) becomes a release asset, where it
+# does not expire the way workflow artifacts do.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # The tag must ship green: same battery as CI before anything is published.
+      - run: pnpm typecheck
+      - run: pnpm build
+      - run: pnpm test
+      # `pnpm sbom` (bare) is a pnpm built-in that requires --sbom-format;
+      # the configured script wraps it (root package.json).
+      - run: pnpm run sbom
+      - name: Publish release with SBOM asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # Idempotent: an interrupted run can re-create (no-op) and re-upload.
+        run: |
+          gh release create "$GITHUB_REF_NAME" --generate-notes --title "vark $GITHUB_REF_NAME" || true
+          gh release upload "$GITHUB_REF_NAME" sbom.json --clobber
