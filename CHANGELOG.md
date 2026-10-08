@@ -5,6 +5,62 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0-beta.2] - 2026-10-08
+
+Second prerelease cut, incorporating the next adversarial-eval round plus CI
+workflow fixes. Same promotion path as `0.2.0-beta.1`: on sign-off this
+content ships as `0.2.0` (stable dist-tag); only the version/tag changes.
+
+### Added
+
+- **Wrapper-aware decode parity (P1):** the runtime's strict decoder now
+  sees what `vark scan` sees — markup wrappers (`<html>…</html>`) are
+  stripped into their own scannable variant, and hex/base64 runs embedded
+  inside any string are extracted (same printability + depth discipline).
+  Payloads smuggled through wrappers no longer pass the runtime while the
+  CLI blocks them; decode provenance includes `html-strip`.
+- **`circuitBreaker.maxDecodeDepth` + `circuitBreaker.strictDecode` (P2):**
+  the decode-depth cap is now configurable (default still 5) and
+  `strictDecode: true` refuses any argument that decodes from an explicit
+  encoding instead of scanning it. Env equivalents `VARK_MAX_DECODE_DEPTH`
+  and `VARK_STRICT_DECODE`.
+- **Baseline SSRF policy on `ctx.sandbox.fetch`:** cloud-metadata endpoints,
+  private/loopback/link-local ranges, `localhost` names, embedded
+  credentials, and non-http(s) schemes are refused in every capability mode
+  — including unrestricted egress — with pre-fetch DNS verification
+  (fail-closed) and per-hop redirect revalidation, so a 302 can never reach
+  a target the original URL could not. `network.allowPrivate` opts in to
+  local-dev targets (metadata stays blocked regardless).
+- **DLP decode parity:** argument strings are scanned through the same
+  strict decoder, so a base64-wrapped AWS key or credit card is redacted /
+  blocked exactly as `vark scan` reports it (the carrier string itself is
+  replaced wholesale).
+- **`VarkMCPAdapter.reconcile()`:** feed freshly fetched `tools/list`
+  results back into the adapter. A server that re-lists a *changed*
+  descriptor — the real schema rug pull, invisible to the wrap-time
+  in-place pin — is permanently refused with `DESCRIPTOR_PIN_VIOLATION`
+  and audited once; `clear()` releases recorded violations so a deliberate
+  re-wrap re-establishes trust.
+
+### Fixed
+
+- Duplicate `export *` statements in the root barrel (spurious duplicate
+  symbols in `index.d.ts`).
+- OpenSSF Scorecard workflow referenced the nonexistent
+  `ossf/scorecard-action@v2` tag — pinned to the `v2.4.4` commit.
+- Node 20 glob expansion for `vark check` (fallout from the Node-22-only
+  `fs.promises.glob`).
+- Install docs (README + EVAL) now carry the stale-shim hint for npm's
+  `EEXIST …/npm/vark` global-install failure
+  (`npm install -g --force @luveo-tech/vark`).
+
+### Changed
+
+- New 39-test regression suite: decode-parity corpus (runtime verdict
+  matches CLI verdict per payload), depth/strict configuration, SSRF
+  defaults incl. redirect revalidation, DLP encoded carriers, descriptor-pin
+  lifecycle, sanitizer fixpoint, and normalization idempotency.
+
 ## [0.2.0-beta.1] - 2026-10-08
 
 Prerelease cut of the 0.2.0 line for adversarial evaluation — tagged

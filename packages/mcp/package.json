@@ -1,6 +1,6 @@
 {
   "name": "@luveo-tech/vark-mcp",
-  "version": "0.2.0-beta.1",
+  "version": "0.2.0-beta.2",
   "description": "MCP adapter for @luveo-tech/vark — wrap Anthropic Model Context Protocol tools with vark's zero-trust security gates (no rewrites).",
   "keywords": [
     "vark",
