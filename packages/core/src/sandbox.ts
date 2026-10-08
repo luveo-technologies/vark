@@ -33,7 +33,14 @@ export function normalizePath(target: string): string {
   return process.platform === 'win32' ? absolute.replace(/\\/g, '/') : absolute;
 }
 
-function globToRegExp(glob: string): RegExp {
+/**
+ * Convert a glob pattern (`*`, double-star segments, `?`) to an anchored
+ * RegExp. Single `*` never crosses `/`; a double-star segment also matches
+ * zero directories; case-insensitive on win32.
+ * Exported for `vark check`'s payload-pattern resolution (Node ≥ 20 has no
+ * `fs.promises.glob`, which is Node 22+).
+ */
+export function globToRegExp(glob: string): RegExp {
   let out = '';
   let i = 0;
   while (i < glob.length) {

@@ -5,10 +5,10 @@
  * without executing target system actions.
  */
 
-import { glob } from 'node:fs/promises';
-import { readFile } from 'node:fs/promises';
+import { readdir, readFile, stat } from 'node:fs/promises';
 import { extname, resolve } from 'node:path';
 import { VarkRuntime } from '../../runtime.js';
+import { globToRegExp } from '../../sandbox.js';
 import type { VarkConfig } from '../../types.js';
 import pkg from 'picocolors';
 const { green, red, yellow, bold, dim } = pkg;
@@ -84,13 +84,70 @@ export async function runCheck(
   return results;
 }
 
+/** Characters that make a path segment a glob pattern rather than a literal. */
+const GLOB_MAGIC = /[*?[\]{}]/;
+
+/**
+ * Expand a payload pattern into absolute file paths.
+ *
+ * Node's `fs.promises.glob` is v22+ and CI runs the test matrix on Node 20,
+ * so this walks the literal base directory (everything before the first
+ * magic segment) and matches the glob remainder with the same matcher the
+ * capability sandbox uses. Plain paths short-circuit to a stat — no walk.
+ */
 async function resolveFiles(pattern: string): Promise<string[]> {
   const resolvedPattern = resolve(pattern);
-  const files = [];
-  for await (const file of glob(resolvedPattern)) {
-    files.push(resolve(file));
+
+  if (!GLOB_MAGIC.test(resolvedPattern)) {
+    try {
+      return (await stat(resolvedPattern)).isFile() ? [resolvedPattern] : [];
+    } catch {
+      return [];
+    }
   }
-  return files;
+
+  const separator = resolvedPattern.includes('\\') ? '\\' : '/';
+  const segments = resolvedPattern.split(/[/\\]+/);
+  const magicAt = segments.findIndex((segment) => GLOB_MAGIC.test(segment));
+  if (magicAt === -1) return [];
+
+  const base = segments.slice(0, magicAt).join(separator) || separator;
+  // The matcher normalises to forward slashes; globToRegExp is
+  // case-insensitive on win32, so backslash remainders match too.
+  const remainder = segments.slice(magicAt).join('/');
+
+  let candidates: string[];
+  try {
+    candidates = await walkFiles(base);
+  } catch {
+    return []; // missing base directory → runCheck reports 'No files found'
+  }
+
+  const matches = globToRegExp(remainder);
+  return candidates
+    .filter((file) =>
+      matches.test(file.slice(base.length).replace(/^[\\/]+/, '').replace(/\\/g, '/')),
+    )
+    .sort();
+}
+
+/** Recursively collect regular files (symlinks count when they resolve to one). */
+async function walkFiles(dir: string, out: string[] = []): Promise<string[]> {
+  for (const entry of await readdir(dir, { withFileTypes: true })) {
+    const full = resolve(dir, entry.name);
+    if (entry.isDirectory()) {
+      await walkFiles(full, out);
+    } else if (entry.isFile()) {
+      out.push(full);
+    } else if (entry.isSymbolicLink()) {
+      try {
+        if ((await stat(full)).isFile()) out.push(full);
+      } catch {
+        // broken link — skip
+      }
+    }
+  }
+  return out;
 }
 
 async function loadPayload(file: string): Promise<unknown> {
