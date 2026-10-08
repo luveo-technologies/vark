@@ -87,11 +87,6 @@ export * from './security/network/index.js';
 export * from './security/paths/index.js';
 export * from './security/shell/index.js';
 export * from './gates/index.js';
-export * from './security/sanitization/index.js';
-export * from './security/network/index.js';
-export * from './security/paths/index.js';
-export * from './security/shell/index.js';
-export * from './gates/index.js';
 
 export { INJECTION_MARKER, sanitizeIndirectInjection, scanIndirectInjection } from './indirect-injection.js';
 export type {
