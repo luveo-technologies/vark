@@ -11,6 +11,7 @@
 import { readFile as fsReadFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
+import { checkEgress, checkEgressSync } from './security/network/ssrf-guard.js';
 import type { CapabilityConfig, ExecutionContext, InspectionResult } from './types.js';
 import { CapabilityViolationError, VarkTimeoutError } from './types.js';
 
@@ -138,15 +139,22 @@ export function checkHostAllowed(url: string, allowedHosts: string[]): Inspectio
 
 function networkPolicy(
   capabilities?: CapabilityConfig,
-): { mode: 'allow' } | { mode: 'deny' } | { mode: 'allowlist'; allowedHosts: string[] } {
+): ({ mode: 'allow' } | { mode: 'deny' } | { mode: 'allowlist'; allowedHosts: string[] }) & {
+  allowPrivate: boolean;
+} {
   const network = capabilities?.network;
-  if (network === false) return { mode: 'deny' };
+  const allowPrivate = typeof network === 'object' && network?.allowPrivate === true;
+  if (network === false) return { mode: 'deny', allowPrivate };
   if (network && typeof network === 'object') {
     const allowedHosts = network.allowedHosts ?? [];
-    if (allowedHosts.length === 0) return { mode: 'deny' };
-    return { mode: 'allowlist', allowedHosts };
+    if (allowedHosts.length === 0) {
+      // No allowlist: deny by default. An explicit `allowPrivate` without a
+      // host list means "unrestricted including local/private targets".
+      return allowPrivate ? { mode: 'allow', allowPrivate } : { mode: 'deny', allowPrivate };
+    }
+    return { mode: 'allowlist', allowedHosts, allowPrivate };
   }
-  return { mode: 'allow' };
+  return { mode: 'allow', allowPrivate };
 }
 
 function isPathLike(key: string, value: string): boolean {
@@ -162,7 +170,6 @@ function isPathLike(key: string, value: string): boolean {
 export function inspectArguments(args: unknown, capabilities?: CapabilityConfig): InspectionResult {
   const allow = capabilities?.filesystem?.allow;
   const policy = networkPolicy(capabilities);
-  if ((!allow || allow.length === 0) && policy.mode === 'allow') return { safe: true };
 
   const walk = (value: unknown, key: string, depth: number): InspectionResult => {
     if (depth > DEPTH_LIMIT) return { safe: true };
@@ -172,15 +179,21 @@ export function inspectArguments(args: unknown, capabilities?: CapabilityConfig)
         const verdict = checkPathAllowed(value, allow);
         if (!verdict.safe) return verdict;
       }
-      if (policy.mode !== 'allow') {
-        URL_PATTERN.lastIndex = 0;
-        const urls = value.match(URL_PATTERN);
-        for (const url of urls ?? []) {
-          if (policy.mode === 'deny') {
-            return { safe: false, reason: `outbound network is disabled, refusing "${url}"` };
-          }
+      URL_PATTERN.lastIndex = 0;
+      for (const url of value.match(URL_PATTERN) ?? []) {
+        if (policy.mode === 'deny') {
+          return { safe: false, reason: `outbound network is disabled, refusing "${url}"` };
+        }
+        if (policy.mode === 'allowlist') {
           const verdict = checkHostAllowed(url, policy.allowedHosts);
           if (!verdict.safe) return verdict;
+        }
+        // Baseline SSRF policy — applies in every mode, including open
+        // egress: metadata endpoints, private ranges, loopback names,
+        // embedded credentials, non-http(s) schemes.
+        const egress = checkEgressSync(url, { allowPrivate: policy.allowPrivate });
+        if (!egress.allowed) {
+          return { safe: false, reason: egress.reason ?? `egress refused for "${url}"` };
         }
       }
       return { safe: true };
@@ -216,12 +229,101 @@ export function assertPathAllowed(target: string, capabilities?: CapabilityConfi
 /** Throwing variant of the network policy check. */
 export function assertNetworkAllowed(url: string, capabilities?: CapabilityConfig): void {
   const policy = networkPolicy(capabilities);
-  if (policy.mode === 'allow') return;
   if (policy.mode === 'deny') {
     throw new CapabilityViolationError(`outbound network is disabled, refusing "${url}"`);
   }
-  const verdict = checkHostAllowed(url, policy.allowedHosts);
-  if (!verdict.safe) throw new CapabilityViolationError(verdict.reason ?? 'network capability violation');
+  if (policy.mode === 'allowlist') {
+    const verdict = checkHostAllowed(url, policy.allowedHosts);
+    if (!verdict.safe) {
+      throw new CapabilityViolationError(verdict.reason ?? 'network capability violation');
+    }
+  }
+  // Baseline SSRF policy — enforced even for unrestricted egress.
+  const egress = checkEgressSync(url, { allowPrivate: policy.allowPrivate });
+  if (!egress.allowed) {
+    throw new CapabilityViolationError(egress.reason ?? `egress refused for "${url}"`);
+  }
+}
+
+/** Redirect statuses followed (each target re-validated through the guard). */
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+/** Redirect hops before the request is refused outright. */
+const MAX_FETCH_REDIRECTS = 5;
+
+/** Bodies that can be replayed on a followed redirect. */
+function isReplayableBody(body: BodyInit | null | undefined): boolean {
+  if (body === undefined || body === null) return true;
+  if (typeof body === 'string') return true;
+  if (body instanceof URLSearchParams) return true;
+  if (typeof Blob !== 'undefined' && body instanceof Blob) return false; // consumed on read
+  if (ArrayBuffer.isView(body) || body instanceof ArrayBuffer) return false;
+  return false;
+}
+
+/**
+ * `fetch` with redirect revalidation: `redirect: 'manual'` on every hop,
+ * each `Location` pushed back through the capability + baseline egress
+ * guards before it is followed — a redirect can never reach an internal or
+ * metadata target that the original URL could not.
+ */
+async function fetchWithRevalidation(
+  url: string,
+  init: RequestInit | undefined,
+  capabilities: CapabilityConfig | undefined,
+): Promise<Response> {
+  let current = url;
+  let method = (init?.method ?? 'GET').toUpperCase();
+  let body: BodyInit | null | undefined = init?.body;
+
+  for (let hop = 0; hop <= MAX_FETCH_REDIRECTS; hop += 1) {
+    const response = await globalThis.fetch(current, {
+      ...init,
+      method,
+      body: body ?? undefined,
+      redirect: 'manual',
+    });
+    if (!REDIRECT_STATUSES.has(response.status)) return response;
+
+    const location = response.headers.get('location');
+    if (!location) return response; // 3xx without a target — hand it back
+    if (hop === MAX_FETCH_REDIRECTS) {
+      throw new CapabilityViolationError(`egress exceeded ${MAX_FETCH_REDIRECTS} redirects`);
+    }
+    // Cannot replay a consumed stream body — return the 3xx unfollowed
+    // rather than replaying or bypassing the guard.
+    if (!isReplayableBody(body)) return response;
+
+    let next: string;
+    try {
+      next = new URL(location, current).toString();
+    } catch {
+      throw new CapabilityViolationError(`unverifiable redirect target "${location}"`);
+    }
+    assertNetworkAllowed(next, capabilities);
+    const policy = networkPolicy(capabilities);
+    const egress = await checkEgress(next, { allowPrivate: policy.allowPrivate });
+    if (!egress.allowed) {
+      throw new CapabilityViolationError(egress.reason ?? `redirect target refused: "${next}"`);
+    }
+
+    // Method handling follows the fetch spec: 303 → GET; 301/302 on a
+    // non-GET/HEAD request → GET; 307/308 preserve method and body.
+    if (
+      response.status === 303 ||
+      ((response.status === 301 || response.status === 302) && method !== 'GET' && method !== 'HEAD')
+    ) {
+      method = 'GET';
+      body = undefined;
+    }
+    try {
+      await response.body?.cancel();
+    } catch {
+      // already consumed or unreadable — nothing to release
+    }
+    current = next;
+  }
+  throw new CapabilityViolationError(`egress exceeded ${MAX_FETCH_REDIRECTS} redirects`);
 }
 
 /** Build the privileged host services handed to `run()`. */
@@ -232,8 +334,15 @@ export function createSandbox(capabilities?: CapabilityConfig): ExecutionContext
       return fsReadFile(resolve(path), 'utf8');
     },
     async fetch(url: string, init?: RequestInit): Promise<Response> {
+      // Sync policy + literal-address guard first (fail fast, no DNS).
       assertNetworkAllowed(url, capabilities);
-      return globalThis.fetch(url, init);
+      // DNS stage — fail-closed: an unresolvable name is refused.
+      const policy = networkPolicy(capabilities);
+      const egress = await checkEgress(url, { allowPrivate: policy.allowPrivate });
+      if (!egress.allowed) {
+        throw new CapabilityViolationError(egress.reason ?? `egress refused for "${url}"`);
+      }
+      return fetchWithRevalidation(url, init, capabilities);
     },
   };
 }

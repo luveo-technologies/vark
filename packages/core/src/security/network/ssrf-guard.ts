@@ -229,3 +229,126 @@ export async function checkRedirect(
   }
   return checkSsrf(redirectUrl, config);
 }
+
+// ── Baseline egress policy (ctx.sandbox.fetch default) ───────────────────────
+
+/** Hostnames that always denote the local host. */
+const LOCAL_HOSTNAMES = new Set([
+  'localhost',
+  'localhost.localdomain',
+  'ip6-localhost',
+  'ip6-loopback',
+]);
+
+/** Metadata service hostnames (IP forms live in METADATA_IPS). */
+const METADATA_HOSTNAMES = new Set([
+  'metadata.google.internal',
+  'metadata.goog',
+  'instance-data.ec2.internal',
+]);
+
+/** Schemes `ctx.sandbox.fetch` will perform. */
+const ALLOWED_SCHEMES = new Set(['http:', 'https:']);
+
+export interface EgressOptions {
+  /**
+   * Permit loopback / RFC1918 / link-local targets (local-dev APIs) and
+   * skip the pre-fetch DNS range check. Cloud-metadata endpoints stay
+   * blocked regardless. @default false
+   */
+  allowPrivate?: boolean;
+}
+
+function stripBrackets(hostname: string): string {
+  return hostname.replace(/^\[/, '').replace(/\]$/, '');
+}
+
+/**
+ * Scheme + credentials + literal-address stage of the baseline egress
+ * policy. Synchronous (no DNS) so gate 2 can apply it to argument URLs
+ * before a tool ever runs.
+ */
+export function checkEgressSync(url: string, options: EgressOptions = {}): SsrfCheckResult {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return { allowed: false, reason: `unverifiable outbound URL "${url}"` };
+  }
+  if (!ALLOWED_SCHEMES.has(parsed.protocol)) {
+    return {
+      allowed: false,
+      reason: `scheme "${parsed.protocol}" is not permitted for egress (http/https only)`,
+    };
+  }
+  if (parsed.username || parsed.password) {
+    return { allowed: false, reason: 'URLs with embedded credentials are not allowed' };
+  }
+
+  const hostname = parsed.hostname.toLowerCase().replace(/\.$/, '');
+  if (METADATA_HOSTNAMES.has(hostname)) {
+    return { allowed: false, reason: 'cloud metadata endpoints are blocked' };
+  }
+  if (LOCAL_HOSTNAMES.has(hostname) || hostname.endsWith('.localhost')) {
+    return options.allowPrivate
+      ? { allowed: true }
+      : { allowed: false, reason: `loopback host "${hostname}" is blocked (network.allowPrivate opts in)` };
+  }
+
+  const literal = stripBrackets(hostname);
+  if (isIP(literal) !== 0) {
+    const normalized = normalizeIp(literal);
+    if (METADATA_IPS.has(normalized)) {
+      return { allowed: false, reason: 'cloud metadata endpoints are blocked' };
+    }
+    if (isIpInBlockedRange(normalized)) {
+      return options.allowPrivate
+        ? { allowed: true, resolvedIp: normalized }
+        : {
+            allowed: false,
+            reason: `private/loopback address ${normalized} is blocked (network.allowPrivate opts in)`,
+          };
+    }
+    return { allowed: true, resolvedIp: normalized };
+  }
+
+  return { allowed: true };
+}
+
+/**
+ * Full baseline egress check: the synchronous stage plus DNS verification
+ * of *every* address a hostname resolves to (fail-closed — an unresolvable
+ * name is refused rather than handed to fetch).
+ */
+export async function checkEgress(url: string, options: EgressOptions = {}): Promise<SsrfCheckResult> {
+  const sync = checkEgressSync(url, options);
+  if (!sync.allowed) return sync;
+
+  let hostname: string;
+  try {
+    hostname = new URL(url).hostname.toLowerCase().replace(/\.$/, '');
+  } catch {
+    return { allowed: false, reason: 'Invalid URL' };
+  }
+  if (isIP(stripBrackets(hostname)) !== 0) return sync; // literal — nothing to resolve
+  if (options.allowPrivate) return sync; // operator opted out of range checks
+
+  try {
+    const addresses = await lookup(hostname, { all: true });
+    if (addresses.length === 0) {
+      return { allowed: false, reason: `DNS resolution for "${hostname}" returned no addresses` };
+    }
+    for (const { address } of addresses) {
+      const normalized = normalizeIp(address);
+      if (METADATA_IPS.has(normalized)) {
+        return { allowed: false, reason: `"${hostname}" resolves to cloud metadata address ${normalized}` };
+      }
+      if (isIpInBlockedRange(normalized)) {
+        return { allowed: false, reason: `"${hostname}" resolves to blocked address ${normalized}` };
+      }
+    }
+    return { allowed: true, resolvedIp: normalizeIp(addresses[0]!.address) };
+  } catch {
+    return { allowed: false, reason: `DNS resolution failed for "${hostname}" (fail-closed)` };
+  }
+}
