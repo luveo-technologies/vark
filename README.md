@@ -1,6 +1,6 @@
 # vark
 
-> ⚠️ **Under active development — v0.2.0-beta.1.** This project is functional but
+> ⚠️ **Under active development — v0.2.0-beta.2.** This project is functional but
 > pre-release: expect bugs, sharp edges, and breaking changes between
 > versions. Do not rely on it as your sole security boundary in production
 > yet. Found something? Report it — see `SECURITY.md`.
@@ -88,7 +88,7 @@ gapped machine — without publishing to npm:
 
 ```bash
 pnpm build            # dist/ must exist in both packages
-pnpm pack:local       # → local-pack/*.tgz, workspace:* deps rewritten to 0.2.0-beta.1
+pnpm pack:local       # → local-pack/*.tgz, workspace:* deps rewritten to 0.2.0-beta.2
 ```
 
 Then in any consumer project, install **both** tarballs in one command so
@@ -96,8 +96,8 @@ npm resolves the MCP adapter's `@luveo-tech/vark` dependency from the local
 core tarball instead of the registry:
 
 ```bash
-npm install ../Vark/local-pack/luveo-tech-vark-0.2.0-beta.1.tgz \
-            ../Vark/local-pack/luveo-tech-vark-mcp-0.2.0-beta.1.tgz
+npm install ../Vark/local-pack/luveo-tech-vark-0.2.0-beta.2.tgz \
+            ../Vark/local-pack/luveo-tech-vark-mcp-0.2.0-beta.2.tgz
 ```
 
 (Inside this monorepo no packing is needed — `pnpm install` links the
@@ -108,6 +108,10 @@ packages via `workspace:*`.)
 The `vark` binary ships inside `@luveo-tech/vark`. Install it globally,
 use it via `npx` with no install, or run it from a local clone.
 Full reference: [`docs/CLI.md`](./docs/CLI.md).
+
+> **Stale global shim?** If `npm install -g` fails with
+> `EEXIST: file already exists …/npm/vark`, a previous install left its
+> shim behind — reinstall with `npm install -g --force @luveo-tech/vark`.
 
 ```bash
 npm install -g @luveo-tech/vark   # global install — `vark` on your PATH

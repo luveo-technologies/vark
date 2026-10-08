@@ -19,6 +19,8 @@ that fail to parse are ignored rather than throwing
 | `VARK_SESSION_TTL_MS` | `anomaly.sessionTTLMs` | Idle-session TTL before `sweepExpired()` evicts it | `0` (off) |
 | `VARK_FREEZE_ON_INJECTION_BLOCK` | `anomaly.freezeOnInjectionBlock` | Freeze the session when gate 7 blocks (`true`/`1`/`false`/`0`) | `false` |
 | `VARK_SCHEMA_STRICT` | `schema.strict` | Strict schema validation (reject instead of coerce) | `false` |
+| `VARK_MAX_DECODE_DEPTH` | `circuitBreaker.maxDecodeDepth` | Recursive decode depth for encoded-payload detection | `5` |
+| `VARK_STRICT_DECODE` | `circuitBreaker.strictDecode` | Refuse any argument that decodes from an explicit encoding | `false` |
 | `VARK_SIEM_WEBHOOK_URL` | `vark audit tail --alert` | Webhook that alert entries are POSTed to | — |
 
 HITL approvals and canary seeding are programmatic APIs (`VarkConfig.hitl`,

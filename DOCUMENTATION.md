@@ -331,10 +331,22 @@ runtime.tool({
 
 | `network` value | Policy |
 | --- | --- |
-| `undefined` / `true` | allow everything |
+| `undefined` / `true` | allow everything **subject to the baseline SSRF policy below** |
 | `false` | deny every outbound URL found in the arguments |
 | `{ allowedHosts: [...] }` | allowlist only; `*.example.com` wildcards supported |
 | `{ allowedHosts: [] }` | **deny** (an explicit empty allowlist is a deny, not "allow all") |
+| `{ allowPrivate: true }` | unrestricted **including** loopback/private targets (local-dev APIs); no allowlist |
+
+**Baseline SSRF policy (since 0.2.0-beta.2).** Independent of the grants
+table above, outbound URLs are always refused when they use a non-http(s)
+scheme, embed credentials, name a cloud-metadata endpoint
+(`169.254.169.254`, `metadata.google.internal`, …), or point at
+loopback/RFC1918/link-local addresses — `ctx.sandbox.fetch` additionally
+verifies every DNS answer before connecting (**fail-closed**: an
+unresolvable name is refused) and re-validates each redirect hop, so a 302
+can never reach a target the original URL could not. Set
+`network.allowPrivate` to permit local targets (metadata endpoints stay
+blocked regardless).
 
 **Defence in depth.** Gate 2 audits the *arguments*; the `ctx.sandbox` handed
 to `run()` re-checks *at the moment of use*:
@@ -408,20 +420,31 @@ always receive the raw value.
 
 **Strict decoding (since 0.2.0).** A third pass scans strictly-decoded
 variants (`decodeEncodedLayers`): percent-encoding, HTML entities, hex,
-base64, and nested chains up to 5 layers deep, so `cm0gLXJmIC8=`,
-`726d202d7266202f` and `run %72m%20-rf%20/` are refused with decode
-provenance in the reason (`(decoded base64→hex)`). Admission is strict —
-only strings with explicit encoding markers are decoded, and only
-text-like results (≥ 70 % printable) are scanned — so opaque tokens (git
-SHAs, UUIDs, session ids) can never trip the pass. `vark scan` still shows
-the *aggressive* `decodeAllLayers` variants for human review.
+base64, and nested chains up to `circuitBreaker.maxDecodeDepth` layers deep
+(default 5, configurable), so `cm0gLXJmIC8=`, `726d202d7266202f` and
+`run %72m%20-rf%20/` are refused with decode provenance in the reason
+(`(decoded base64→hex)`). Admission is strict — only strings with explicit
+encoding markers are decoded, and only text-like results (≥ 70 % printable)
+are scanned — so opaque tokens (git SHAs, UUIDs, session ids) can never trip
+the pass. **Wrapper-aware (since 0.2.0-beta.2):** markup wrappers
+(`<html>…</html>`) are stripped into their own variant and hex/base64 runs
+embedded inside any string are extracted, so the runtime and `vark scan`
+reach the same verdict on smuggled payloads — the CLI's *aggressive*
+`decodeAllLayers` variants are still shown for human review.
+`circuitBreaker.strictDecode: true` (or `VARK_STRICT_DECODE`) flips the pass
+from *scan the decoded forms* to *refuse anything decodable* for deployments
+that never accept encoded input.
 
 ### Gate 4 — Input DLP
 
 **File:** `dlp.ts` · **Config:** `VarkConfig.dlp` · **Refusal:** `DLP_REDACTED` (only in `mode: 'block'`)
 
 Scans every string in the arguments and replaces matches with
-`[REDACTED_SECRET: <TYPE>]` **before `run()` sees them**.
+`[REDACTED_SECRET: <TYPE>]` **before `run()` sees them**. Strings that look
+plain are also scanned through the strict decoder first (since
+0.2.0-beta.2): a secret hidden inside an encoding is still a secret, so a
+base64-wrapped `AKIA…` carrier is replaced wholesale — the same verdict
+`vark scan` reports.
 
 Built-in scanners, in priority order (first match claims the span; overlapping
 later matches are skipped):
@@ -764,6 +787,8 @@ tool.
 | `blockShellInjection` | `boolean` | `true` | Shell separator/substitution patterns |
 | `blockPathTraversal` | `boolean` | `true` | Traversal + sensitive-path patterns |
 | `customRules` | `Array<(argName, value) => boolean \| string>` | `[]` | `false`/`undefined` pass, `true` block, `string` block with that reason |
+| `maxDecodeDepth` | `number` | `5` | Recursive decode depth for encoded-payload detection (raise to catch deeper nesting) |
+| `strictDecode` | `boolean` | `false` | `true` → refuse any argument that decodes from an explicit encoding instead of scanning it |
 
 `argName` is the *path* to the value (`command`, `filters.path`, `tags[0]`, …).
 Payload walking is depth-capped at 12.
@@ -1128,6 +1153,21 @@ descriptor hash; a mismatch refuses the call with
 reaches the server. Re-wrap (`wrapTools(...)`) to accept a new descriptor
 deliberately. `hashDescriptor(tool)` is exported for your own pinning.
 
+**Re-listings (since 0.2.0-beta.2).** The in-place check only sees mutations
+of the object captured at wrap time; a server that returns *new* objects on
+its next `tools/list` (the real schema rug pull) is only visible when the
+host feeds that listing back in:
+
+```ts
+const failures = adapter.reconcile(freshToolList);  // [] = every pin intact
+// failures → [{ name, reason }] — those tools are now permanently refused
+// with DESCRIPTOR_PIN_VIOLATION (audited once) on check()/execute()
+```
+
+Call `reconcile()` on `notifications/list_changed`, reconnects, or polls;
+`adapter.clear()` releases recorded violations so a deliberate re-wrap can
+re-establish trust.
+
 ```ts
 await tools[0].execute({ url: 'https://docs.example.com/intro' });  // ✅ ALLOWED
 await tools[0].execute({ url: 'https://evil.example.net/steal' });  // ❌ CAPABILITY_VIOLATION
@@ -1448,7 +1488,15 @@ Pair them with `mode: 'block'`.
 
 **Is an empty `network.allowedHosts` allow-all?**
 No — `{ allowedHosts: [] }` **denies** everything. Omit `network` (or pass
-`true`) for unrestricted egress.
+`true`) for unrestricted egress (the baseline SSRF policy — metadata
+endpoints, private ranges, embedded credentials — still applies; add
+`allowPrivate: true` for local-dev targets).
+
+**Does the baseline SSRF policy ever block a legitimate internal API?**
+Only if you allowlist an internal host *and* its address is private. Set
+`network.allowPrivate` to permit loopback/RFC1918 targets; cloud-metadata
+endpoints stay blocked regardless — there is no legitimate agent use for
+them.
 
 **Does `check()` count against `maxCallsPerMinute`?**
 No. `check()` uses `anomaly.check()` (pure preview); only `execute()` consumes
@@ -1477,7 +1525,7 @@ this. Nothing degrades silently.
 
 **Is `vark` published to npm?**
 Yes — `@luveo-tech/vark` and `@luveo-tech/vark-mcp` are on npm (0.1.0 /
-0.1.1 published; this release is `0.2.0-beta.1`, a prerelease of the 0.2.0
+0.1.1 published; this release is `0.2.0-beta.2`, a prerelease of the 0.2.0
 line pending evaluation sign-off). Inside this monorepo the packages
 are consumed via `workspace:*`.
 
