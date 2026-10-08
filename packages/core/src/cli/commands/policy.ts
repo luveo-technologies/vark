@@ -52,12 +52,14 @@ export interface PolicyTestResult {
 
 export async function runPolicyTest(
   policyPath: string,
+  opts: { quiet?: boolean } = {},
 ): Promise<{ passed: number; failed: number; results: PolicyTestResult[] }> {
   const resolvedPath = resolve(policyPath);
   const policy = await loadPolicy(resolvedPath);
 
   if (!policy.tests || policy.tests.length === 0) {
-    console.log(`${yellow('⚠')} No tests found in policy file`);
+    // `quiet` keeps stdout pure NDJSON for --output-format streaming-json.
+    if (!opts.quiet) console.log(`${yellow('⚠')} No tests found in policy file`);
     return { passed: 0, failed: 0, results: [] };
   }
 

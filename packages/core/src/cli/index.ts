@@ -34,6 +34,7 @@ import {
   printInit,
 } from './commands/ops.js';
 import { printSessionStats } from './commands/analyze.js';
+import { resolveOutputFormat, writeEvent } from './stream.js';
 import { readFile, writeFile } from 'node:fs/promises';
 import pkg from 'picocolors';
 const { red } = pkg;
@@ -60,9 +61,19 @@ program
   .option('-c, --config <file>', 'Path to Vark config file')
   .option('-w, --watch', 'Re-run when matched files change')
   .option('-v, --verbose', 'Explain the blocking gate for each refusal')
-  .action(async (file: string, options: { config?: string; watch?: boolean; verbose?: boolean }) => {
+  .option('--output-format <format>', 'Output format: text (default) | streaming-json (NDJSON)', 'text')
+  .action(async (file: string, options: { config?: string; watch?: boolean; verbose?: boolean; outputFormat?: string }) => {
+    let streaming: boolean;
+    try {
+      streaming = resolveOutputFormat(options.outputFormat) === 'streaming-json';
+    } catch (error) {
+      console.error(`${red('Error:')} ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+      return;
+    }
+
     const runOnce = async (run: number): Promise<void> => {
-      if (options.watch && run > 1) console.log(`\n  ── run #${run} ──`);
+      if (options.watch && run > 1 && !streaming) console.log(`\n  ── run #${run} ──`);
       const started = Date.now();
       try {
         let config: Record<string, unknown> = {};
@@ -71,10 +82,31 @@ program
           config = JSON.parse(content);
         }
 
-        const results = await runCheck(file, config);
-        printCheckResults(results, { elapsedMs: Date.now() - started, verbose: options.verbose });
+        const results = await runCheck(
+          file,
+          config,
+          streaming ? (result) => writeEvent({ type: 'result', command: 'check', ...result }) : undefined,
+        );
+        if (streaming) {
+          const passed = results.filter((r) => r.success).length;
+          const blocked = results.length - passed;
+          writeEvent({
+            type: 'summary',
+            command: 'check',
+            passed,
+            blocked,
+            total: results.length,
+            ok: blocked === 0,
+            elapsedMs: Date.now() - started,
+          });
+          if (blocked > 0) process.exitCode = 1;
+        } else {
+          printCheckResults(results, { elapsedMs: Date.now() - started, verbose: options.verbose });
+        }
       } catch (error) {
-        console.error(`${red('Error:')} ${error instanceof Error ? error.message : String(error)}`);
+        const message = error instanceof Error ? error.message : String(error);
+        if (streaming) writeEvent({ type: 'error', command: 'check', message });
+        else console.error(`${red('Error:')} ${message}`);
         process.exitCode = 1;
       }
     };
@@ -106,13 +138,40 @@ program
 program
   .command('scan <input>')
   .description('Scan text, a file, or stdin through the detection stages (use "-" for stdin)')
-  .action(async (input: string) => {
+  .option('--output-format <format>', 'Output format: text (default) | streaming-json (NDJSON)', 'text')
+  .action(async (input: string, options: { outputFormat?: string }) => {
+    let streaming: boolean;
+    try {
+      streaming = resolveOutputFormat(options.outputFormat) === 'streaming-json';
+    } catch (error) {
+      console.error(`${red('Error:')} ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+      return;
+    }
     const started = Date.now();
     try {
       const result = await runScan(input);
-      printScanResult(result, Date.now() - started);
+      if (streaming) {
+        writeEvent({ type: 'result', command: 'scan', ...result });
+        writeEvent({
+          type: 'summary',
+          command: 'scan',
+          triggered: result.triggered,
+          ok: !result.triggered,
+          elapsedMs: Date.now() - started,
+        });
+        if (result.triggered) process.exitCode = 1;
+      } else {
+        printScanResult(result, Date.now() - started);
+      }
     } catch (error) {
-      console.error(`${red('Error:')} ${error instanceof Error ? error.message : String(error)}`);
+      const message = error instanceof Error ? error.message : String(error);
+      if (streaming) {
+        writeEvent({ type: 'error', command: 'scan', message });
+        process.exitCode = 1;
+        return;
+      }
+      console.error(`${red('Error:')} ${message}`);
       process.exit(1);
     }
   });
@@ -220,13 +279,43 @@ const policyCmd = program
 policyCmd
   .command('test <policy>')
   .description('Execute unit test assertions against a declarative policy file')
-  .action(async (policy: string) => {
-    const started = Date.now();
+  .option('--output-format <format>', 'Output format: text (default) | streaming-json (NDJSON)', 'text')
+  .action(async (policy: string, options: { outputFormat?: string }) => {
+    let streaming: boolean;
     try {
-      const results = await runPolicyTest(policy);
-      printTestResults(results, Date.now() - started);
+      streaming = resolveOutputFormat(options.outputFormat) === 'streaming-json';
     } catch (error) {
       console.error(`${red('Error:')} ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+      return;
+    }
+    const started = Date.now();
+    try {
+      const results = await runPolicyTest(policy, { quiet: streaming });
+      if (streaming) {
+        for (const result of results.results) {
+          writeEvent({ type: 'result', command: 'policy-test', ...result });
+        }
+        writeEvent({
+          type: 'summary',
+          command: 'policy-test',
+          passed: results.passed,
+          failed: results.failed,
+          ok: results.failed === 0,
+          elapsedMs: Date.now() - started,
+        });
+        if (results.failed > 0) process.exitCode = 1;
+      } else {
+        printTestResults(results, Date.now() - started);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (streaming) {
+        writeEvent({ type: 'error', command: 'policy-test', message });
+        process.exitCode = 1;
+        return;
+      }
+      console.error(`${red('Error:')} ${message}`);
       process.exit(1);
     }
   });
@@ -316,11 +405,39 @@ const sessionCmd = program
 sessionCmd
   .command('stats <log>')
   .description('Per-session call/block table derived from an audit log')
-  .action(async (log: string) => {
+  .option('--output-format <format>', 'Output format: text (default) | streaming-json (NDJSON)', 'text')
+  .action(async (log: string, options: { outputFormat?: string }) => {
+    let streaming: boolean;
     try {
-      printSessionStats(await runSessionStats(log));
+      streaming = resolveOutputFormat(options.outputFormat) === 'streaming-json';
     } catch (error) {
       console.error(`${red('Error:')} ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+      return;
+    }
+    const started = Date.now();
+    try {
+      const rows = await runSessionStats(log);
+      if (streaming) {
+        for (const row of rows) writeEvent({ type: 'result', command: 'session-stats', ...row });
+        writeEvent({
+          type: 'summary',
+          command: 'session-stats',
+          sessions: rows.length,
+          ok: true,
+          elapsedMs: Date.now() - started,
+        });
+      } else {
+        printSessionStats(rows);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (streaming) {
+        writeEvent({ type: 'error', command: 'session-stats', message });
+        process.exitCode = 1;
+        return;
+      }
+      console.error(`${red('Error:')} ${message}`);
       process.exit(1);
     }
   });

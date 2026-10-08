@@ -31,6 +31,7 @@ export interface CheckResult {
 export async function runCheck(
   pattern: string,
   config: VarkConfig = {},
+  onResult?: (result: CheckResult) => void,
 ): Promise<CheckResult[]> {
   // Resolve files from pattern
   const files = await resolveFiles(pattern);
@@ -43,13 +44,20 @@ export async function runCheck(
   const registered = new Set<string>();
   const results: CheckResult[] = [];
 
+  // Surface every result the moment it exists — streaming-json consumers
+  // render decisions per payload instead of waiting for the whole batch.
+  const record = (result: CheckResult): void => {
+    results.push(result);
+    onResult?.(result);
+  };
+
   for (const file of files) {
     let payload: unknown;
     try {
       payload = await loadPayload(file);
     } catch (error) {
       // A malformed file fails its own entry — the rest of the batch still runs.
-      results.push({
+      record({
         file,
         tool: 'unknown',
         success: false,
@@ -78,7 +86,7 @@ export async function runCheck(
       });
     }
     const result = await runSingleCheck(runtime, file, payload);
-    results.push(result);
+    record(result);
   }
 
   return results;

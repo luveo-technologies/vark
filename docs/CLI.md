@@ -39,6 +39,8 @@ The `vark` binary ships inside `@luveo-tech/vark` (`bin: dist/cli/index.js`).
 Install the package and the `vark` command is on your PATH. All commands use
 CI-friendly exit codes (`0` = pass/intact, `1` = blocked/corrupt/fail) and
 print plain line-based output that works identically on a TTY and in CI.
+Decision-reporting commands additionally accept
+`--output-format streaming-json` for machine ingestion (see **Commands**).
 
 ```bash
 vark --help
@@ -63,7 +65,18 @@ vark doctor
 
 ## Commands
 
-### `vark check <file> [--watch] [-v] [-c config]`
+`check`, `scan`, `policy test`, and `session stats` accept
+`--output-format <format>`:
+
+- `text` (default) — the human-oriented output described below.
+- `streaming-json` — one JSON event per line on stdout *as it happens*:
+  `{"type":"result",…}` per item, then a final `{"type":"summary",…}` carrying
+  the `ok` verdict (failures emit `{"type":"error",…}` instead). Banner,
+  progress, and color are suppressed so the stream is pure NDJSON for log
+  shippers (Vector, Fluent Bit, SIEM pipelines), and exit codes are
+  identical to text mode.
+
+### `vark check <file> [--watch] [-v] [-c config] [--output-format <format>]`
 
 Dry-run payload files (`{ tool, args, identity? }`, JSON) against the guard
 pipeline without executing anything. Supports globs. `--watch` re-runs on file
@@ -77,7 +90,7 @@ and gate tuning come from `-c config.json` (`defaultCapabilities`,
 `circuitBreaker`, …). Malformed files fail their own entry instead of
 aborting the batch.
 
-### `vark scan <input>`
+### `vark scan <input> [--output-format <format>]`
 
 Scan raw text, a file, or stdin (`-`) through the detection stages with a
 live per-stage pipeline view: normalizer (decoded variants) → circuit breaker
@@ -111,7 +124,7 @@ streaming-friendly), full-field CSV (decision, reason, findings, prevHash,
 sanitizedInputs, untruncated hashes), or a single-file styled HTML report.
 `[log]` defaults to `$VARK_AUDIT_PATH`.
 
-### `vark policy test <policy>`
+### `vark policy test <policy> [--output-format <format>]`
 
 Run `shouldAllow`/`shouldBlock` assertions against a declarative policy file
 (tools + tests, JSON). Each tool's `run` string is compiled and executed for
@@ -149,7 +162,7 @@ strings. Flags high-entropy + high-similarity output as a prompt-leak risk
 Preview Compact Tool Protocol compression: the TS signature plus a token
 savings bar.
 
-### `vark session stats <log>`
+### `vark session stats <log> [--output-format <format>]`
 
 Per-session call/block table derived from an audit log.
 

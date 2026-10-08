@@ -1295,6 +1295,7 @@ and CI. Full reference: [`docs/CLI.md`](./docs/CLI.md).
 
 ```bash
 vark check payload.json            # dry-run (globs, --watch, -v remediation hints)
+vark check payloads/*.json --output-format streaming-json   # NDJSON for log shippers
 vark scan "Ignore all rules…"      # per-stage detection pipeline
 vark bench                         # p99 budget table (exit 1 if over)
 vark audit verify audit.jsonl      # hash-chain VALID/CORRUPTED + first break
