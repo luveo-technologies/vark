@@ -1364,7 +1364,7 @@ Not yet. It is reserved and currently behaves as `'process'` (documented in
 `types.ts`).
 
 **Is `vark` published to npm?**
-Both packages are `0.1.0` workspace packages in this monorepo, consumed via
+Both packages are `0.1.1` workspace packages in this monorepo, consumed via
 `workspace:*`. The install commands in §2 apply once published.
 
 ---

@@ -1,6 +1,6 @@
 # vark
 
-> ⚠️ **Under active development — v0.1.0.** This project is functional but
+> ⚠️ **Under active development — v0.1.1.** This project is functional but
 > pre-release: expect bugs, sharp edges, and breaking changes between
 > versions. Do not rely on it as your sole security boundary in production
 > yet. Found something? Report it — see `SECURITY.md`.
