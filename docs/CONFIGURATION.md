@@ -139,6 +139,19 @@ every subsequent call is refused **before gate 1** — no execution without a
 durable record. The refusal record's own append probes the sink, so the next
 call proceeds automatically once a write succeeds again.
 
+## OpenTelemetry (OTLP)
+
+`OtlpAuditExporter` implements `AuditSink` and batches audit records to an
+OTLP/HTTP collector as log records — `endpoint` (default
+`http://localhost:4318/v1/logs`), `serviceName`, `headers` (collector auth),
+`maxBatchSize` (default 64), `flushIntervalMs` (default 5_000; `0` = manual
+`flush()` only), `includeSanitizedInputs`, `onError`, `failClosed`.
+
+```ts
+const otlp = new OtlpAuditExporter({ endpoint: 'https://otel.example.com/v1/logs' });
+const runtime = new VarkRuntime({ audit: { sink: (entry) => otlp.write(entry) } });
+```
+
 ## AnomalyGuardConfig
 
 ```ts

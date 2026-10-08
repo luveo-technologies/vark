@@ -55,6 +55,8 @@ export {
   createDefaultAuditSink,
 } from './audit-sink.js';
 export type { AuditSink, AuditSinkOptions } from './audit-sink.js';
+export { OtlpAuditExporter, toOtlpLogRecord, DEFAULT_OTLP_LOGS_ENDPOINT } from './otlp-exporter.js';
+export type { OtlpExporterOptions, OtlpLogRecord, OtlpAttribute } from './otlp-exporter.js';
 
 export {
   executeIsolated,

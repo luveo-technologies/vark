@@ -7,6 +7,7 @@ import { runPolicyTest } from '../packages/core/src/cli/commands/policy.js';
 import { resolveOutputFormat, writeEvent } from '../packages/core/src/cli/stream.js';
 import { resolveIsolationMode, isTrueIsolationAvailable } from '../packages/core/src/isolated-vm.js';
 import { FileAuditSink } from '../packages/core/src/audit-sink.js';
+import { OtlpAuditExporter, toOtlpLogRecord, DEFAULT_OTLP_LOGS_ENDPOINT } from '../packages/core/src/otlp-exporter.js';
 import { VarkRuntime } from '../packages/core/src/index.js';
 import type { AuditEntry } from '../packages/core/src/types.js';
 
@@ -19,6 +20,7 @@ import type { AuditEntry } from '../packages/core/src/types.js';
  *  - P0: fail-closed on dependency loss — no true isolate boundary (or an
  *    unpersistable audit trail with `audit.failClosed`) refuses instead of
  *    silently degrading.
+ *  - P0: OTLP/HTTP exporter shipping audit records to any OTel collector.
  */
 
 // isolated-vm is an OPTIONAL dependency and absent from CI: runtime-level
@@ -39,6 +41,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await rm(FIXTURE_DIR, { recursive: true, force: true });
+  vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
 
@@ -310,5 +313,181 @@ describe('fail-closed audit trail', () => {
     expect(() => sink.write(entry)).not.toThrow();
 
     await sink.close();
+  });
+});
+
+// ── P0-2: OTLP/HTTP audit exporter ──────────────────────────────────────────
+
+function auditEntry(overrides: Partial<AuditEntry> = {}): AuditEntry {
+  return {
+    seq: 7,
+    timestamp: '2026-10-09T00:00:00.000Z',
+    sessionId: 'agent-1',
+    tool: 'read_file',
+    decision: 'ALLOWED',
+    sanitizedInputs: { path: './notes.txt' },
+    inputRedactions: 0,
+    outputRedactions: 0,
+    injectionSanitized: 0,
+    executionTimeMs: 12.5,
+    inspectionMs: 0.25,
+    tokensSaved: 3,
+    findings: [],
+    prevHash: '0'.repeat(64),
+    hash: 'a'.repeat(64),
+    ...overrides,
+  } as AuditEntry;
+}
+
+describe('toOtlpLogRecord mapping', () => {
+  it('maps an allowed entry with nanosecond time and INFO severity', () => {
+    const record = toOtlpLogRecord(auditEntry());
+    expect(record.timeUnixNano).toBe(String(BigInt(Date.parse('2026-10-09T00:00:00.000Z')) * 1_000_000n));
+    expect(record.severityText).toBe('INFO');
+    expect(record.body.stringValue).toBe('ALLOWED'); // no reason on allowed entries → decision
+
+    const attrs = new Map(record.attributes.map((a) => [a.key, a.value]));
+    expect(attrs.get('vark.decision')).toEqual({ stringValue: 'ALLOWED' });
+    expect(attrs.get('vark.seq')).toEqual({ intValue: '7' });
+    expect(attrs.get('vark.session_id')).toEqual({ stringValue: 'agent-1' });
+    expect(attrs.get('vark.blocked_by')).toBeUndefined();
+    expect(attrs.get('vark.sanitized_inputs')).toBeUndefined(); // opt-in only
+  });
+
+  it('maps refusals at WARN with blockedBy, reason body and findings', () => {
+    const record = toOtlpLogRecord(
+      auditEntry({
+        decision: 'CIRCUIT_BREAKER',
+        blockedBy: 'CIRCUIT_BREAKER',
+        reason: 'shell metacharacter',
+        findings: ['injection'],
+      }),
+    );
+    expect(record.severityText).toBe('WARN');
+    expect(record.body.stringValue).toBe('shell metacharacter');
+
+    const attrs = new Map(record.attributes.map((a) => [a.key, a.value]));
+    expect(attrs.get('vark.blocked_by')).toEqual({ stringValue: 'CIRCUIT_BREAKER' });
+    expect(attrs.get('vark.findings')).toEqual({ arrayValue: { values: [{ stringValue: 'injection' }] } });
+  });
+
+  it('includes sanitizedInputs only when explicitly opted in', () => {
+    const record = toOtlpLogRecord(auditEntry(), true);
+    const attrs = new Map(record.attributes.map((a) => [a.key, a.value]));
+    expect(attrs.get('vark.sanitized_inputs')).toEqual({ stringValue: '{"path":"./notes.txt"}' });
+  });
+});
+
+describe('OtlpAuditExporter', () => {
+  function stubFetch(impl?: (url: string, init: RequestInit) => Promise<unknown>) {
+    const fetchMock = vi.fn(
+      impl ?? (async () => ({ ok: true, status: 200, statusText: 'OK' })),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  function requestBody(fetchMock: ReturnType<typeof vi.fn>, call = 0): Record<string, unknown> {
+    const [, init] = fetchMock.mock.calls[call] as [string, RequestInit];
+    return JSON.parse(String(init.body)) as Record<string, unknown>;
+  }
+
+  it('buffers below the batch size and exports an OTLP/HTTP payload on flush', async () => {
+    const fetchMock = stubFetch();
+    const exporter = new OtlpAuditExporter({
+      endpoint: 'http://collector:4318/v1/logs',
+      serviceName: 'payments-guard',
+      maxBatchSize: 10,
+      flushIntervalMs: 0,
+      headers: { authorization: 'Bearer t' },
+    });
+
+    exporter.write(auditEntry({ seq: 1 }));
+    exporter.write(auditEntry({ seq: 2 }));
+    expect(fetchMock).not.toHaveBeenCalled(); // still buffered
+    expect(exporter.pending).toBe(2);
+
+    await exporter.flush();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('http://collector:4318/v1/logs');
+    expect((init.headers as Record<string, string>)['content-type']).toBe('application/json');
+    expect((init.headers as Record<string, string>).authorization).toBe('Bearer t');
+
+    const body = requestBody(fetchMock) as {
+      resourceLogs: Array<{
+        resource: { attributes: Array<{ key: string; value: { stringValue: string } }> };
+        scopeLogs: Array<{ scope: { name: string }; logRecords: Array<Record<string, unknown>> }>;
+      }>;
+    };
+    const scope = body.resourceLogs[0]!.scopeLogs[0]!;
+    expect(scope.scope.name).toBe('vark.audit');
+    expect(scope.logRecords).toHaveLength(2);
+    expect(body.resourceLogs[0]!.resource.attributes[0]).toEqual({
+      key: 'service.name',
+      value: { stringValue: 'payments-guard' },
+    });
+    expect(exporter.pending).toBe(0);
+    await exporter.close();
+  });
+
+  it('auto-exports once the batch size is reached', async () => {
+    const fetchMock = stubFetch();
+    const exporter = new OtlpAuditExporter({ maxBatchSize: 2, flushIntervalMs: 0 });
+    exporter.write(auditEntry({ seq: 1 }));
+    expect(fetchMock).not.toHaveBeenCalled();
+    exporter.write(auditEntry({ seq: 2 }));
+    await exporter.flush(); // awaits the in-flight auto-export pump
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const body = requestBody(fetchMock) as {
+      resourceLogs: Array<{ scopeLogs: Array<{ logRecords: unknown[] }> }>;
+    };
+    expect(body.resourceLogs[0]!.scopeLogs[0]!.logRecords).toHaveLength(2);
+    await exporter.close();
+  });
+
+  it('reports HTTP failures through onError and tracks failed state', async () => {
+    const errors: string[] = [];
+    stubFetch(async () => ({ ok: false, status: 503, statusText: 'unavailable' }));
+    const exporter = new OtlpAuditExporter({
+      flushIntervalMs: 0,
+      onError: (error) => errors.push(error.message),
+    });
+
+    exporter.write(auditEntry());
+    await exporter.flush();
+    expect(errors[0]).toContain('HTTP 503');
+    expect(exporter.failed).toBe(true);
+    await exporter.close();
+  });
+
+  it('failClosed surfaces the previous failure on the next write, and recovers', async () => {
+    let healthy = false;
+    stubFetch(async () =>
+      healthy
+        ? ({ ok: true, status: 200, statusText: 'OK' } as unknown)
+        : ({ ok: false, status: 500, statusText: 'boom' } as unknown),
+    );
+    const exporter = new OtlpAuditExporter({ flushIntervalMs: 0, failClosed: true });
+
+    exporter.write(auditEntry({ seq: 1 }));
+    await exporter.flush(); // export fails → failed
+    expect(exporter.failed).toBe(true);
+
+    healthy = true; // collector restored
+    // The next write surfaces the previous failure synchronously while its
+    // probe export restores the healthy state.
+    expect(() => exporter.write(auditEntry({ seq: 2 }))).toThrow(/HTTP 500/);
+    await exporter.flush();
+    expect(exporter.failed).toBe(false);
+    expect(() => exporter.write(auditEntry({ seq: 3 }))).not.toThrow();
+    await exporter.close();
+  });
+
+  it('uses the standard local-collector endpoint by default', () => {
+    stubFetch();
+    const exporter = new OtlpAuditExporter({ flushIntervalMs: 0 });
+    expect(DEFAULT_OTLP_LOGS_ENDPOINT).toBe('http://localhost:4318/v1/logs');
+    void exporter.close();
   });
 });

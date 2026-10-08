@@ -905,6 +905,36 @@ stableStringify(value);                        // canonical JSON (sorted keys, c
 > `blockedBy` set → refused; `blockedBy` absent → allowed (possibly sanitized).
 > `findings` always lists every gate that fired on the call.
 
+#### OpenTelemetry export (OTLP)
+
+`OtlpAuditExporter` ships records to any OTLP/HTTP collector (Jaeger, Tempo,
+Datadog, Honeycomb, an OTel Collector gateway) as OTLP log records — zero
+dependencies, batched, over the built-in `fetch`:
+
+```ts
+import { OtlpAuditExporter } from '@luveo-tech/vark';
+
+const otlp = new OtlpAuditExporter({
+  endpoint: 'http://otel-collector:4318/v1/logs',  // default
+  serviceName: 'payments-guard',                   // resource: service.name
+  headers: { authorization: `Bearer ${TOKEN}` },   // collector auth
+  maxBatchSize: 64,                                // auto-export trigger
+  flushIntervalMs: 5_000,                          // 0 = manual flush only
+});
+
+const runtime = new VarkRuntime({ audit: { sink: (entry) => otlp.write(entry) } });
+await otlp.close(); // final flush on shutdown
+```
+
+Mapping: decision, `blockedBy`, session, tool, `seq`, redaction counters and
+the hash chain land under `vark.*` attributes; the reason is the log body.
+Refusals export at `severityText: 'WARN'` (allowed → `INFO`) so collector
+alerting rules fire on security events. `sanitizedInputs` is attached only
+with `includeSanitizedInputs: true` (accurate, but potentially large).
+Failures go to `onError`; with `failClosed: true` the next `write()` throws
+the previous failure while probing the collector — pair with `audit.failClosed`
+for a refuse-until-export-works runtime.
+
 ### 4.10 Errors
 
 Thrown **inside** `run()` / the sandbox (never out of `execute()`):
@@ -955,8 +985,10 @@ type AnomalySessionStats, AnomalyVerdict, AnomalyCause
 
 // audit (gate 8)
 AuditLogger, GENESIS_HASH, stableStringify, verifyAuditEntry, generateAuditKeyPair,
-KmsAuditSigner, FileAuditSink, StreamAuditSink, MultiAuditSink, createDefaultAuditSink
-type AuditAppendInput, AuditVerifyResult, AuditSink, AuditSinkOptions
+KmsAuditSigner, FileAuditSink, StreamAuditSink, MultiAuditSink, createDefaultAuditSink,
+OtlpAuditExporter, toOtlpLogRecord, DEFAULT_OTLP_LOGS_ENDPOINT
+type AuditAppendInput, AuditVerifyResult, AuditSink, AuditSinkOptions,
+OtlpExporterOptions, OtlpLogRecord, OtlpAttribute
 
 // execution & isolation (gate 5)
 DEFAULT_MAX_EXECUTION_MS, createSandbox, inspectArguments, withTimeout,
