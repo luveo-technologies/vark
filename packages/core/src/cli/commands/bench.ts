@@ -22,6 +22,8 @@ export interface BenchOptions {
   iterations?: number;
   /** Iterations for the per-gate rows (cheaper than the breaker sweep). @default 2000 */
   gateIterations?: number;
+  /** p99 budget in ms — the report fails (exit 1) at or above it. @default 1 */
+  maxP99?: number;
 }
 
 export interface GateBenchRow {
@@ -38,6 +40,8 @@ export interface BenchReport {
   p50Ms: number;
   p99Ms: number;
   maxMs: number;
+  /** Effective p99 budget in ms (from `--max-p99`, default 1). */
+  budgetMs: number;
   withinBudget: boolean;
   gates: GateBenchRow[];
 }
@@ -157,6 +161,7 @@ export async function runPerGateBench(iterations = 2000): Promise<GateBenchRow[]
 
 export async function runBench(options: BenchOptions = {}): Promise<BenchReport> {
   const iterations = options.iterations ?? 20_000;
+  const budgetMs = options.maxP99 ?? 1;
   const bench = benchmarkInspection(ATTACK_PAYLOAD, undefined, iterations);
   return {
     iterations: bench.iterations,
@@ -164,7 +169,8 @@ export async function runBench(options: BenchOptions = {}): Promise<BenchReport>
     p50Ms: bench.p50Ms,
     p99Ms: bench.p99Ms,
     maxMs: bench.maxMs,
-    withinBudget: bench.p99Ms < 1,
+    budgetMs,
+    withinBudget: bench.p99Ms < budgetMs,
     gates: await runPerGateBench(options.gateIterations ?? 2000),
   };
 }
@@ -180,7 +186,7 @@ export function printBenchReport(report: BenchReport, elapsedMs?: number): void 
         ['metric', 'ms', 'budget'],
         ['avg', cell(report.avgMs), dim('< 1.0000')],
         ['p50', cell(report.p50Ms), dim('< 1.0000')],
-        ['p99', cell(report.p99Ms), dim('< 1.0000')],
+        ['p99', cell(report.p99Ms), dim(`< ${report.budgetMs.toFixed(4)}`)],
         ['max', dim(report.maxMs.toFixed(4)), dim('GC/scheduler')],
       ],
       { head: true },
@@ -190,8 +196,8 @@ export function printBenchReport(report: BenchReport, elapsedMs?: number): void 
   printSummaryLine(
     [
       report.withinBudget
-        ? green('✔ p99 inside the sub-millisecond budget')
-        : red('✘ p99 OVER budget'),
+        ? green(`✔ p99 inside budget (< ${report.budgetMs.toFixed(4)}ms)`)
+        : red(`✘ p99 OVER budget (≥ ${report.budgetMs.toFixed(4)}ms)`),
       dim(`payload: shell + traversal + benign note`),
     ],
   );
@@ -229,7 +235,11 @@ export function printBenchReport(report: BenchReport, elapsedMs?: number): void 
 /** One-line assertion helper used by CI gates. */
 export function assertBenchBudget(report: BenchReport): void {
   if (!report.withinBudget) {
-    throw new Error(`benchmark budget exceeded: p99=${report.p99Ms.toFixed(4)}ms >= 1ms`);
+    throw new Error(
+      `benchmark budget exceeded: p99=${report.p99Ms.toFixed(4)}ms >= ${report.budgetMs}ms`,
+    );
   }
-  console.log(bold(green(`✔ benchmark budget holds (p99=${report.p99Ms.toFixed(4)}ms)`)));
+  console.log(
+    bold(green(`✔ benchmark budget holds (p99=${report.p99Ms.toFixed(4)}ms < ${report.budgetMs}ms)`)),
+  );
 }

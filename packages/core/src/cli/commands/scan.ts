@@ -5,6 +5,11 @@
  * Unlike `check` (which dry-runs a registered tool), `scan` takes arbitrary
  * text — a prompt, a tool argument, a fetched page — and shows exactly which
  * detection stage fires: normalization → circuit breaker → DLP → injection.
+ *
+ * `--direction` selects the side of the tool boundary: `input` (default)
+ * scans arguments/prompts with all gates; `output` scans text a tool
+ * returned, where the circuit breaker intentionally does not apply and
+ * DLP + injection are the police.
  */
 
 import { readFile } from 'node:fs/promises';
@@ -26,8 +31,21 @@ export interface ScanStageResult {
   detail: string;
 }
 
+/**
+ * Which side of the tool boundary the text sits on:
+ * - `input`  — tool arguments / prompts (gate 3 circuit breaker applies)
+ * - `output` — text a tool returned (gates 6–7: DLP + injection; the
+ *   breaker intentionally does not gate outputs — tool output is data)
+ */
+export type ScanDirection = 'input' | 'output';
+
+export interface ScanOptions {
+  direction?: ScanDirection;
+}
+
 export interface ScanResult {
   source: string;
+  direction: ScanDirection;
   originalLength: number;
   decodedVariants: number;
   stages: ScanStageResult[];
@@ -51,7 +69,8 @@ async function loadText(input: string): Promise<{ source: string; text: string }
   }
 }
 
-export async function runScan(input: string): Promise<ScanResult> {
+export async function runScan(input: string, options: ScanOptions = {}): Promise<ScanResult> {
+  const direction: ScanDirection = options.direction ?? 'input';
   const { source, text } = await loadText(input);
 
   // Stage 0 — normalization (always "runs", reports what it found)
@@ -59,13 +78,18 @@ export async function runScan(input: string): Promise<ScanResult> {
   const normalized = variants[0] ?? text;
   const changed = normalized !== text || variants.length > 1;
 
-  // Scan every decoded variant; the breaker sees what the attacker hides
+  // Scan every decoded variant; the breaker sees what the attacker hides.
+  // Output direction skips it: gate 3 inspects tool INPUTS — text a tool
+  // returned is data to the breaker, and gates 6–7 (DLP + injection) below
+  // are what police it.
   let breakerHit: string | undefined;
-  for (const variant of variants) {
-    const verdict = inspectPayload({ input: variant }, undefined, 'input');
-    if (!verdict.safe && verdict.reason) {
-      breakerHit = verdict.reason;
-      break;
+  if (direction === 'input') {
+    for (const variant of variants) {
+      const verdict = inspectPayload({ input: variant }, undefined, 'input');
+      if (!verdict.safe && verdict.reason) {
+        breakerHit = verdict.reason;
+        break;
+      }
     }
   }
 
@@ -96,7 +120,10 @@ export async function runScan(input: string): Promise<ScanResult> {
       id: 'breaker',
       label: 'Circuit Breaker',
       fired: breakerHit !== undefined,
-      detail: breakerHit ?? 'no shell/traversal signatures',
+      detail:
+        direction === 'output'
+          ? 'n/a — gate 3 inspects tool inputs; outputs are gated by DLP + injection'
+          : (breakerHit ?? 'no shell/traversal signatures'),
     },
     {
       id: 'dlp',
@@ -115,6 +142,7 @@ export async function runScan(input: string): Promise<ScanResult> {
 
   return {
     source,
+    direction,
     originalLength: text.length,
     decodedVariants: variants.length,
     stages,
@@ -123,7 +151,7 @@ export async function runScan(input: string): Promise<ScanResult> {
 }
 
 export function printScanResult(result: ScanResult, elapsedMs?: number): void {
-  printBanner(`scan  ·  ${result.source} (${result.originalLength} chars)`);
+  printBanner(`scan  ·  ${result.direction}  ·  ${result.source} (${result.originalLength} chars)`);
 
   const states: GateState[] = result.stages.map((s) => ({
     id: s.id,

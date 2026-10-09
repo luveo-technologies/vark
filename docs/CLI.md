@@ -90,16 +90,22 @@ and gate tuning come from `-c config.json` (`defaultCapabilities`,
 `circuitBreaker`, …). Malformed files fail their own entry instead of
 aborting the batch.
 
-### `vark scan <input> [--output-format <format>]`
+### `vark scan <input> [--direction <input|output>] [--output-format <format>]`
 
 Scan raw text, a file, or stdin (`-`) through the detection stages with a
 live per-stage pipeline view: normalizer (decoded variants) → circuit breaker
 → secret scanner → injection filter (regex + semantic). Exit 1 on detection.
 
-### `vark bench [-n iterations]`
+`--direction input` (default) scans tool arguments/prompts with every gate.
+`--direction output` scans text a tool **returned**: the circuit breaker is
+skipped — gate 3 inspects inputs, output is data — and DLP + injection are
+the police, mirroring gates 6–7. Unknown directions are rejected (exit 1).
+
+### `vark bench [-n iterations] [--max-p99 <ms>]`
 
 Circuit-breaker micro-benchmark over a mixed attack/benign payload. Prints
-avg/p50/p99/max and asserts the p99 sub-millisecond budget (exit 1 if over).
+avg/p50/p99/max and asserts the p99 against the budget — 1 ms by default,
+or `--max-p99 <ms>` to set your own for CI (exit 1 when at or over it).
 Below the headline table, a **per-gate table** reports avg/p50/p99/max for
 every pipeline gate (anomaly, capability, breaker, schema, input-dlp,
 output-dlp+injection, audit) on representative payloads.

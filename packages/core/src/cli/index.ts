@@ -138,8 +138,9 @@ program
 program
   .command('scan <input>')
   .description('Scan text, a file, or stdin through the detection stages (use "-" for stdin)')
+  .option('--direction <direction>', 'Text direction: input (default, tool args/prompts) | output (tool results)', 'input')
   .option('--output-format <format>', 'Output format: text (default) | streaming-json (NDJSON)', 'text')
-  .action(async (input: string, options: { outputFormat?: string }) => {
+  .action(async (input: string, options: { direction?: string; outputFormat?: string }) => {
     let streaming: boolean;
     try {
       streaming = resolveOutputFormat(options.outputFormat) === 'streaming-json';
@@ -148,9 +149,17 @@ program
       process.exitCode = 1;
       return;
     }
+    if (options.direction !== 'input' && options.direction !== 'output') {
+      console.error(
+        `${red('Error:')} unknown direction "${options.direction}" — expected "input" or "output"`,
+      );
+      process.exitCode = 1;
+      return;
+    }
+    const direction = options.direction;
     const started = Date.now();
     try {
-      const result = await runScan(input);
+      const result = await runScan(input, { direction });
       if (streaming) {
         writeEvent({ type: 'result', command: 'scan', ...result });
         writeEvent({
@@ -182,11 +191,18 @@ program
   .command('bench')
   .description('Circuit-breaker micro-benchmark with p99 budget assertion')
   .option('-n, --iterations <n>', 'Inspection iterations', '20000')
-  .action(async (options: { iterations?: string }) => {
+  .option('--max-p99 <ms>', 'Fail (exit 1) when the headline p99 exceeds this many ms (default 1)')
+  .action(async (options: { iterations?: string; maxP99?: string }) => {
     const started = Date.now();
     const iterations = Math.max(1, Number(options.iterations ?? 20000));
+    const maxP99 = options.maxP99 === undefined ? undefined : Number(options.maxP99);
+    if (maxP99 !== undefined && !Number.isFinite(maxP99)) {
+      console.error(`${red('Error:')} --max-p99 must be a number (got "${options.maxP99}")`);
+      process.exitCode = 1;
+      return;
+    }
     try {
-      const report = await runBench({ iterations });
+      const report = await runBench({ iterations, maxP99 });
       printBenchReport(report, Date.now() - started);
     } catch (error) {
       console.error(`${red('Error:')} ${error instanceof Error ? error.message : String(error)}`);
