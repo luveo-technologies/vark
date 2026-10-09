@@ -20,6 +20,9 @@
 
 import { AnomalyGuard } from './anomaly-guard.js';
 import type { AnomalyCause } from './anomaly-guard.js';
+import { AdaptiveRiskAssessor, tierAtLeast } from './adaptive-risk.js';
+import type { AdaptiveRiskConfig } from './adaptive-risk.js';
+import { BreakGlassManager } from './break-glass.js';
 import { AuditLogger, stableStringify } from './audit-logger.js';
 import { inspectPayload } from './circuit-breaker.js';
 import { analyzeCompression, estimateTokens } from './compressor.js';
@@ -29,11 +32,13 @@ import { sanitizeIndirectInjection } from './indirect-injection.js';
 import { coerceValueDeep, validateSchema } from './schema-validator.js';
 import { applyEnvOverrides } from './env-config.js';
 import { resolveIsolationMode } from './isolated-vm.js';
+import type { HitlCapability } from './gates/hitl-gate.js';
 import { DEFAULT_MAX_EXECUTION_MS, createSandbox, inspectArguments, withTimeout } from './sandbox.js';
 import type {
   AnomalyGuardConfig,
   AuditLoggerConfig,
   BlockedBy,
+  BreakGlassRuntimeConfig,
   CapabilityConfig,
   CircuitBreakerConfig,
   DlpConfig,
@@ -90,6 +95,8 @@ export interface ResolvedVarkConfig {
   audit: AuditLoggerConfig;
   schema: SchemaValidationConfig;
   hitl?: HitlRuntimeConfig;
+  risk: AdaptiveRiskConfig;
+  breakGlass?: BreakGlassRuntimeConfig;
 }
 
 export const DEFAULT_SESSION = 'default';
@@ -100,6 +107,10 @@ export class VarkRuntime {
   readonly audit: AuditLogger;
   /** Per-session loop / velocity state. */
   readonly anomaly: AnomalyGuard;
+  /** Adaptive per-tool risk scoring (history-decayed, feeds gate 4b). */
+  readonly risk: AdaptiveRiskAssessor;
+  /** Time-boxed, audited operator override for operational gates. */
+  readonly breakGlass: BreakGlassManager;
 
   #session: string;
   #isolationWarned = false;
@@ -121,9 +132,36 @@ export class VarkRuntime {
       audit: cfg.audit ?? {},
       schema: cfg.schema ?? {},
       ...(cfg.hitl ? { hitl: cfg.hitl } : {}),
+      risk: cfg.risk ?? {},
+      ...(cfg.breakGlass ? { breakGlass: cfg.breakGlass } : {}),
     };
     this.audit = new AuditLogger(this.config.audit);
     this.anomaly = new AnomalyGuard(this.config.anomaly);
+    this.risk = new AdaptiveRiskAssessor(this.config.risk);
+    // Break-glass transitions always land in the audit trail — the manager's
+    // onEvent is reserved for that append, not user config.
+    this.breakGlass = new BreakGlassManager({
+      ...(this.config.breakGlass ?? {}),
+      onEvent: (event) => {
+        const session = event.session;
+        this.audit.append({
+          sessionId: 'break-glass',
+          tool: 'break-glass',
+          decision: 'ALLOWED',
+          reason:
+            `${event.type}: id=${session.id} by=${session.by} scopes=${session.scopes.join('+')} ` +
+            `reason="${session.reason}" expiresAt=${new Date(session.expiresAt).toISOString()}`,
+          findings: [`BREAK_GLASS_${event.type.toUpperCase()}`],
+          sanitizedInputs: null,
+          executionTimeMs: 0,
+        });
+      },
+    });
+    if (this.risk.escalateTier && !this.config.hitl) {
+      console.warn(
+        'vark: risk.escalateTier is set but hitl is not configured — risk-driven approval escalation has no gate to call and is inert',
+      );
+    }
     this.#session = cfg.sessionId ?? DEFAULT_SESSION;
     this.#warmup();
   }
@@ -334,13 +372,18 @@ export class VarkRuntime {
       reason = reason ? `${reason}; ${message}` : message;
     };
 
-    const refusal = (blockedBy: BlockedBy, message: string): ToolExecutionResult<TResult> => ({
-      success: false,
-      error: message,
-      blockedBy,
-      executionTimeMs: elapsed(),
-      sessionId,
-    });
+    const refusal = (blockedBy: BlockedBy, message: string): ToolExecutionResult<TResult> => {
+      // Adaptive risk: every refusal teaches the assessor something about
+      // this tool (score rises → possible gate-4b escalation later).
+      this.risk.recordBlock(tool, message);
+      return {
+        success: false,
+        error: message,
+        blockedBy,
+        executionTimeMs: elapsed(),
+        sessionId,
+      };
+    };
 
     /** Gate 8 — append telemetry for every path, allowed or not. */
     const commit = (result: ToolExecutionResult<TResult>): ToolExecutionResult<TResult> => {
@@ -391,7 +434,19 @@ export class VarkRuntime {
     // ── 1. Anomaly guard ────────────────────────────────────────────────
     const anomaly = await this.anomaly.record(sessionId, tool, args);
     if (!anomaly.safe) {
-      return commit(refusal(anomalyBlockedBy(anomaly.cause), anomaly.reason ?? 'anomaly guard refused the call'));
+      if (this.breakGlass.isBypassing('anomaly')) {
+        // Operational override: keep counting (the session record still
+        // accounts for this call), but proceed — audited both here and in
+        // the BREAK_GLASS finding on this call's own audit entry.
+        const bg = this.breakGlass.status().session;
+        flag('BREAK_GLASS');
+        note(
+          `anomaly refusal (${anomaly.cause}) bypassed by break-glass ` +
+            `(${bg?.id ?? 'unknown'} by ${bg?.by ?? 'unknown'}: ${bg?.reason ?? ''})`,
+        );
+      } else {
+        return commit(refusal(anomalyBlockedBy(anomaly.cause), anomaly.reason ?? 'anomaly guard refused the call'));
+      }
     }
 
     // ── 2. Capability sandbox ───────────────────────────────────────────
@@ -468,26 +523,52 @@ export class VarkRuntime {
       }
     }
 
-    // ── 4b. Human-in-the-loop approval (only for mapped high-risk tools) ──
-    const hitlCapability = this.config.hitl?.tools[tool];
+    // ── 4b. Human-in-the-loop approval (mapped tools + risk escalation) ──
+    let hitlCapability: string | undefined = this.config.hitl?.tools[tool];
+    let syntheticCapability: HitlCapability | undefined;
+    // Adaptive risk: an unmapped tool whose score climbed to the configured
+    // tier also pauses for approval — nobody has to hand-list every tool.
+    if (this.config.hitl && !hitlCapability && this.risk.escalateTier) {
+      const assessment = this.risk.assess(tool);
+      if (tierAtLeast(assessment.tier, this.risk.escalateTier)) {
+        hitlCapability = `risk:${tool}`;
+        syntheticCapability = {
+          id: hitlCapability,
+          description: `adaptive risk escalation for "${tool}" (score ${assessment.score}, tier ${assessment.tier})`,
+          risk: assessment.tier,
+        };
+      }
+    }
     if (hitlCapability && this.config.hitl) {
-      const approval = await this.config.hitl.gate.requestApproval(
-        hitlCapability,
-        sessionId,
-        tool,
-        sanitizedInputs,
-        { timeoutMs: this.config.hitl.timeoutMs ?? 60_000 },
-      );
-      if (!approval.approved) {
-        flag('HITL_DENIED');
-        const message =
-          `high-risk capability "${hitlCapability}" ` +
-          (approval.decidedBy === 'system'
-            ? 'timed out awaiting approval'
-            : `denied by ${approval.decidedBy}`) +
-          (approval.reason ? `: ${approval.reason}` : '');
-        note(message);
-        return commit(refusal('HITL_DENIED', message));
+      if (this.breakGlass.isBypassing('hitl')) {
+        const bg = this.breakGlass.status().session;
+        flag('BREAK_GLASS');
+        note(
+          `HITL approval for "${hitlCapability}" bypassed by break-glass ` +
+            `(${bg?.id ?? 'unknown'} by ${bg?.by ?? 'unknown'}: ${bg?.reason ?? ''})`,
+        );
+      } else {
+        const approval = await this.config.hitl.gate.requestApproval(
+          hitlCapability,
+          sessionId,
+          tool,
+          sanitizedInputs,
+          {
+            timeoutMs: this.config.hitl.timeoutMs ?? 60_000,
+            ...(syntheticCapability ? { capability: syntheticCapability } : {}),
+          },
+        );
+        if (!approval.approved) {
+          flag('HITL_DENIED');
+          const message =
+            `high-risk capability "${hitlCapability}" ` +
+            (approval.decidedBy === 'system'
+              ? 'timed out awaiting approval'
+              : `denied by ${approval.decidedBy}`) +
+            (approval.reason ? `: ${approval.reason}` : '');
+          note(message);
+          return commit(refusal('HITL_DENIED', message));
+        }
       }
     }
 
@@ -541,6 +622,10 @@ export class VarkRuntime {
       sessionId,
       estimateTokens(typeof data === 'string' ? data : stableStringify(data)),
     );
+
+    // Adaptive risk: a completed call is evidence the tool is behaving —
+    // recovery drifts the score back toward its configured base.
+    this.risk.recordCleanRun(tool);
 
     const result: ToolExecutionResult<TResult> = {
       success: true,

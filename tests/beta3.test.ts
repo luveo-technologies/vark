@@ -6,6 +6,9 @@ import { runCheck } from '../packages/core/src/cli/commands/check.js';
 import { runPolicyTest, signPolicyFile, verifyPolicyFile, diffPolicyFiles, generatePolicyKeyFiles } from '../packages/core/src/cli/commands/policy.js';
 import { policyKeyId } from '../packages/core/src/policy-signature.js';
 import { diffPolicy } from '../packages/core/src/policy-diff.js';
+import { HitlGate, signWebhookBody, verifyWebhookSignature } from '../packages/core/src/gates/hitl-gate.js';
+import type { HitlCapability } from '../packages/core/src/gates/hitl-gate.js';
+import { AdaptiveRiskAssessor, tierForScore, tierAtLeast } from '../packages/core/src/adaptive-risk.js';
 import { runScan } from '../packages/core/src/cli/commands/scan.js';
 import { runBench, assertBenchBudget } from '../packages/core/src/cli/commands/bench.js';
 import { resolveOutputFormat, writeEvent } from '../packages/core/src/cli/stream.js';
@@ -948,5 +951,374 @@ describe('policy diff / drift detection', () => {
     expect(aLabel).toBe(a);
     expect(entries).toHaveLength(4);
     await expect(diffPolicyFiles(a, join(FIXTURE_DIR, 'missing.json'))).rejects.toThrow(/ENOENT|no such file/i);
+  });
+});
+
+// ── beta.3 additions: HITL quorum + webhook, adaptive risk, break-glass ──────
+
+const RISK_CAP: HitlCapability = { id: 'db:drop', description: 'Drop database tables', risk: 'critical' };
+
+describe('HITL approval quorum', () => {
+  it('quorum 2: first approval keeps it pending, the second settles', async () => {
+    const gate = new HitlGate({ requiredCapabilities: [RISK_CAP], quorum: { required: 2 } });
+    const promise = gate.requestApproval('db:drop', 's', 'drop_table', {});
+    const id = gate.getPendingRequests()[0]!.requestId;
+
+    expect(gate.approve(id, 'alice')).toBe(true);
+    expect(gate.getRequest(id)!.status).toBe('pending'); // 1 of 2
+    expect(gate.getDecisions(id)).toEqual([
+      expect.objectContaining({ by: 'alice', approved: true }),
+    ]);
+
+    expect(gate.approve(id, 'bob')).toBe(true);
+    const decision = await promise;
+    expect(decision.approved).toBe(true);
+    expect(decision.decidedBy).toBe('bob'); // settling approver
+    expect(gate.getRequest(id)!.decidedBy).toBe('alice+bob'); // ledger
+    expect(gate.getDecisions(id)).toHaveLength(2);
+  });
+
+  it('one approver cannot vote twice, and a single denial vetoes any quorum', async () => {
+    const gate = new HitlGate({ requiredCapabilities: [RISK_CAP], quorum: { required: 3 } });
+    const promise = gate.requestApproval('db:drop', 's', 'drop_table', {});
+    const id = gate.getPendingRequests()[0]!.requestId;
+
+    expect(gate.approve(id, 'alice')).toBe(true);
+    expect(gate.approve(id, 'alice')).toBe(false); // duplicate vote
+    expect(gate.approve(id, 'bob')).toBe(true);
+    expect(gate.getRequest(id)!.status).toBe('pending'); // 2 of 3 distinct
+
+    expect(gate.deny(id, 'carol', 'not verified')).toBe(true); // veto
+    await expect(promise).resolves.toMatchObject({ approved: false, decidedBy: 'carol' });
+    expect(gate.getDecisions(id)).toHaveLength(3);
+  });
+
+  it('approver whitelist: outsiders cannot decide at all', async () => {
+    const gate = new HitlGate({
+      requiredCapabilities: [RISK_CAP],
+      quorum: { required: 1, approvers: ['alice', 'bob'] },
+    });
+    const promise = gate.requestApproval('db:drop', 's', 'drop_table', {});
+    const id = gate.getPendingRequests()[0]!.requestId;
+
+    expect(gate.approve(id, 'mallory')).toBe(false);
+    expect(gate.deny(id, 'mallory')).toBe(false);
+    expect(gate.getRequest(id)!.status).toBe('pending');
+
+    expect(gate.approve(id, 'alice')).toBe(true);
+    await expect(promise).resolves.toMatchObject({ approved: true, decidedBy: 'alice' });
+  });
+
+  it('default quorum preserves single-approver behaviour', async () => {
+    const gate = new HitlGate({ requiredCapabilities: [RISK_CAP] });
+    const promise = gate.requestApproval('db:drop', 's', 'drop_table', {});
+    const id = gate.getPendingRequests()[0]!.requestId;
+    expect(gate.approve(id, 'admin')).toBe(true);
+    await expect(promise).resolves.toMatchObject({ approved: true, decidedBy: 'admin' });
+  });
+});
+
+describe('HITL webhook fan-out', () => {
+  it('POSTs an HMAC-signed payload with quorum context', async () => {
+    const calls: Array<{ url: unknown; init: RequestInit }> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: unknown, init: RequestInit) => {
+        calls.push({ url, init });
+        return new Response('{}', { status: 200 });
+      }),
+    );
+    const gate = new HitlGate({
+      requiredCapabilities: [RISK_CAP],
+      quorum: { required: 2 },
+      webhook: { url: 'https://approvals.example/hitl', secret: 's3cret' },
+    });
+    const promise = gate.requestApproval('db:drop', 's1', 'drop_table', { table: 'users' });
+
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
+    const body = String(calls[0]!.init.body);
+    const parsed = JSON.parse(body) as {
+      event: string;
+      request: { tool: string; requestId: string };
+      quorum: { required: number; approvals: number };
+    };
+    expect(calls[0]!.url).toBe('https://approvals.example/hitl');
+    expect(parsed.event).toBe('hitl.approval.requested');
+    expect(parsed.request.tool).toBe('drop_table');
+    expect(parsed.quorum).toMatchObject({ required: 2, approvals: 0 });
+
+    const headers = calls[0]!.init.headers as Record<string, string>;
+    expect(headers['x-vark-signature']).toBe(signWebhookBody('s3cret', body));
+    expect(verifyWebhookSignature('s3cret', body, headers['x-vark-signature']!)).toBe(true);
+    expect(verifyWebhookSignature('wrong-secret', body, headers['x-vark-signature']!)).toBe(false);
+
+    gate.deny(gate.getPendingRequests()[0]!.requestId, 'alice', 'settling');
+    await expect(promise).resolves.toMatchObject({ approved: false });
+  });
+
+  it('required webhook: delivery failure denies outright (fail-closed)', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        throw new Error('ECONNREFUSED');
+      }),
+    );
+    const errors: string[] = [];
+    const gate = new HitlGate({
+      requiredCapabilities: [RISK_CAP],
+      webhook: { url: 'https://approvals.example/hitl', required: true },
+      onWebhookError: (error) => errors.push(error.message),
+    });
+    const decision = await gate.requestApproval('db:drop', 's', 'drop_table', {}, { timeoutMs: 60_000 });
+    expect(decision.approved).toBe(false);
+    expect(decision.reason).toContain('webhook delivery failed');
+    expect(errors).toEqual(['ECONNREFUSED']);
+    expect(gate.pendingCount).toBe(0); // no leaked timer/resolver
+  });
+
+  it('best-effort webhook: failure keeps the request pending for in-band approvers', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        throw new Error('ECONNREFUSED');
+      }),
+    );
+    let notified = false;
+    const gate = new HitlGate({
+      requiredCapabilities: [RISK_CAP],
+      webhook: { url: 'https://approvals.example/hitl' },
+      onWebhookError: () => {
+        notified = true;
+      },
+    });
+    const promise = gate.requestApproval('db:drop', 's', 'drop_table', {});
+    await vi.waitFor(() => expect(notified).toBe(true));
+    expect(gate.pendingCount).toBe(1); // still waiting for a human
+    expect(gate.approve(gate.getPendingRequests()[0]!.requestId, 'ops')).toBe(true);
+    await expect(promise).resolves.toMatchObject({ approved: true, decidedBy: 'ops' });
+  });
+});
+
+describe('adaptive per-tool risk', () => {
+  it('scores = base + live signals, floored at base, tiered by threshold', () => {
+    const risk = new AdaptiveRiskAssessor({
+      tools: { w: 10 },
+      blockPenalty: 25,
+      recoveryPerCleanRun: 5,
+      signalTtlMs: 60_000,
+    });
+    expect(risk.assess('w')).toMatchObject({ score: 10, tier: 'low', penalty: 0 });
+    expect(risk.assess('unlisted')).toMatchObject({ score: 0, base: 0 });
+
+    risk.recordBlock('w', 'circuit breaker tripped');
+    const blocked = risk.assess('w');
+    expect(blocked).toMatchObject({ score: 35, tier: 'medium', penalty: 25 });
+    expect(blocked.reasons[0]).toContain('circuit breaker tripped');
+
+    risk.recordCleanRun('w');
+    expect(risk.assess('w').score).toBe(30);
+
+    for (let i = 0; i < 10; i += 1) risk.recordCleanRun('w');
+    expect(risk.assess('w').score).toBe(10); // floored at the configured base
+  });
+
+  it('signals expire after signalTtlMs — scrutiny relaxes over time', async () => {
+    const risk = new AdaptiveRiskAssessor({ signalTtlMs: 20, blockPenalty: 30 });
+    risk.recordBlock('t', 'boom');
+    expect(risk.assess('t').score).toBe(30);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(risk.assess('t').score).toBe(0);
+  });
+
+  it('tierForScore / tierAtLeast use inclusive thresholds', () => {
+    expect(tierForScore(0)).toBe('low');
+    expect(tierForScore(24)).toBe('low');
+    expect(tierForScore(25)).toBe('medium');
+    expect(tierForScore(50)).toBe('high');
+    expect(tierForScore(75)).toBe('critical');
+    expect(tierAtLeast('high', 'medium')).toBe(true);
+    expect(tierAtLeast('low', 'high')).toBe(false);
+    expect(tierAtLeast('critical', 'critical')).toBe(true);
+  });
+
+  it('refusals escalate an unmapped tool into gate 4b approval', async () => {
+    const gate = new HitlGate({ requiredCapabilities: [] });
+    const runtime = new VarkRuntime({
+      hitl: { gate, tools: {}, timeoutMs: 5_000 },
+      risk: { tools: { probe: 0 }, blockPenalty: 25, escalateTier: 'high' },
+    });
+    runtime.tool({
+      name: 'probe',
+      description: 'probe tool',
+      schema: { type: 'object', properties: { path: { type: 'string' } } },
+      capabilities: { filesystem: { allow: ['./workspace/*'] } },
+      run: async (args: unknown) => args,
+    });
+
+    // Two capability refusals: 0 → 25 (medium) → 50 (high = threshold).
+    await runtime.execute('probe', { path: '../../etc/passwd' }, { sessionId: 'r1' });
+    await runtime.execute('probe', { path: '../../etc/shadow' }, { sessionId: 'r1' });
+    expect(runtime.risk.assess('probe')).toMatchObject({ score: 50, tier: 'high' });
+
+    // The next legitimate call pauses for approval — synthetic capability.
+    const pendingPromise = runtime.execute('probe', { path: './workspace/ok.txt' }, { sessionId: 'r1' });
+    await vi.waitFor(() => expect(gate.getPendingRequests()).toHaveLength(1));
+    const pending = gate.getPendingRequests()[0]!;
+    expect(pending.tool).toBe('probe');
+    expect(pending.capability.id).toBe('risk:probe');
+    expect(pending.capability.risk).toBe('high');
+    expect(pending.capability.description).toContain('score 50');
+
+    expect(gate.approve(pending.requestId, 'ops', 'legit')).toBe(true);
+    const result = await pendingPromise;
+    expect(result.success).toBe(true);
+    // The approved clean run walks the score back down.
+    expect(runtime.risk.assess('probe').score).toBe(45);
+  });
+
+  it('escalation is off unless risk.escalateTier is configured', async () => {
+    const gate = new HitlGate({ requiredCapabilities: [] });
+    const runtime = new VarkRuntime({
+      hitl: { gate, tools: {}, timeoutMs: 1_000 },
+      risk: { blockPenalty: 25 },
+    });
+    runtime.tool({
+      name: 'probe',
+      description: 'probe tool',
+      schema: { type: 'object', properties: { path: { type: 'string' } } },
+      capabilities: { filesystem: { allow: ['./workspace/*'] } },
+      run: async (args: unknown) => args,
+    });
+    await runtime.execute('probe', { path: '../../etc/passwd' }, { sessionId: 'r2' });
+    await runtime.execute('probe', { path: '../../etc/shadow' }, { sessionId: 'r2' });
+    expect(runtime.risk.assess('probe').score).toBe(50); // high…
+
+    const ok = await runtime.execute('probe', { path: './workspace/ok.txt' }, { sessionId: 'r2' });
+    expect(ok.success).toBe(true);
+    expect(gate.pendingCount).toBe(0); // …but nobody asked for approval
+  });
+
+  it('escalateTier without a hitl gate warns once at construction', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    new VarkRuntime({ risk: { escalateTier: 'high' } });
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]![0])).toContain('risk.escalateTier is set but hitl is not configured');
+  });
+});
+
+describe('break-glass mode', () => {
+  function makeEchoRuntime(config: ConstructorParameters<typeof VarkRuntime>[0] = {}): VarkRuntime {
+    const runtime = new VarkRuntime(config);
+    runtime.tool({
+      name: 'echo',
+      description: 'echo args',
+      schema: { type: 'object' },
+      run: async (args: unknown) => args,
+    });
+    return runtime;
+  }
+
+  it('enable/disable emit audited transitions and enforce scopes', () => {
+    const runtime = makeEchoRuntime();
+    expect(runtime.breakGlass.active).toBe(false);
+    expect(runtime.breakGlass.isBypassing('anomaly')).toBe(false);
+
+    const session = runtime.breakGlass.enable({
+      reason: 'approver rota down during incident-42',
+      by: 'oncall-1',
+      scopes: ['anomaly'],
+      durationMs: 5_000,
+    });
+    expect(session.scopes).toEqual(['anomaly']);
+    expect(runtime.breakGlass.isBypassing('anomaly')).toBe(true);
+    expect(runtime.breakGlass.isBypassing('hitl')).toBe(false);
+    expect(runtime.breakGlass.status().remainingMs).toBeGreaterThan(4_000);
+
+    expect(() => runtime.breakGlass.enable({ reason: 'x', by: 'y' })).toThrow(/already active/);
+
+    const enabled = runtime.audit.trail().find((e) => e.findings.includes('BREAK_GLASS_ENABLED'));
+    expect(enabled).toBeDefined();
+    expect(enabled!.sessionId).toBe('break-glass');
+    expect(enabled!.reason).toContain('approver rota down during incident-42');
+    expect(enabled!.reason).toContain('by=oncall-1');
+
+    const disabled = runtime.breakGlass.disable();
+    expect(disabled?.id).toBe(session.id);
+    expect(runtime.breakGlass.disable()).toBeUndefined();
+    expect(runtime.audit.trail().some((e) => e.findings.includes('BREAK_GLASS_DISABLED'))).toBe(true);
+  });
+
+  it('requires a reason and an operator, validates scopes, clamps duration', () => {
+    const runtime = makeEchoRuntime();
+    expect(() => runtime.breakGlass.enable({ reason: '  ', by: 'x' })).toThrow(/reason/);
+    expect(() => runtime.breakGlass.enable({ reason: 'r', by: '' })).toThrow(/`by`/);
+    expect(() =>
+      runtime.breakGlass.enable({ reason: 'r', by: 'x', scopes: ['everything' as never] }),
+    ).toThrow(/unknown break-glass scope/);
+    expect(() => runtime.breakGlass.enable({ reason: 'r', by: 'x', durationMs: 0 })).toThrow(/positive/);
+
+    const session = runtime.breakGlass.enable({ reason: 'r', by: 'x', durationMs: 999_999_999 });
+    expect(session.expiresAt - session.enabledAt).toBe(900_000); // capped at maxDurationMs
+    expect(runtime.breakGlass.status().session?.scopes).toEqual(['hitl', 'anomaly']); // default: both
+    runtime.breakGlass.disable();
+  });
+
+  it('anomaly scope lets a frozen session proceed — detection gates stay armed', async () => {
+    const runtime = makeEchoRuntime();
+    await runtime.execute('echo', { warm: 'up' }, { sessionId: 's1' }); // session must exist to freeze
+    expect(await runtime.freezeSession('s1', 'admin lock')).toBe(true);
+    expect((await runtime.execute('echo', { a: 1 }, { sessionId: 's1' })).blockedBy).toBe('SESSION_FROZEN');
+
+    runtime.breakGlass.enable({ reason: 'incident-42', by: 'oncall', scopes: ['anomaly'] });
+    const allowed = await runtime.execute('echo', { a: 1 }, { sessionId: 's1' });
+    expect(allowed.success).toBe(true);
+    const echoEntries = runtime.audit.trail().filter((e) => e.tool === 'echo');
+    expect(echoEntries.at(-1)!.findings).toContain('BREAK_GLASS');
+
+    // Break-glass does NOT open the detection gates:
+    const attack = await runtime.execute('echo', { command: 'rm -rf /' }, { sessionId: 's1' });
+    expect(attack.blockedBy).toBe('CIRCUIT_BREAKER');
+
+    runtime.breakGlass.disable();
+    expect((await runtime.execute('echo', { a: 1 }, { sessionId: 's1' })).blockedBy).toBe('SESSION_FROZEN');
+  });
+
+  it('hitl scope skips approval entirely; without it the same call is denyable', async () => {
+    const gate = new HitlGate({ requiredCapabilities: [RISK_CAP] });
+    const runtime = makeEchoRuntime({ hitl: { gate, tools: { drop: 'db:drop' }, timeoutMs: 5_000 } });
+    runtime.tool({
+      name: 'drop',
+      description: 'drop a table',
+      schema: { type: 'object' },
+      run: async () => 'dropped',
+    });
+
+    runtime.breakGlass.enable({ reason: 'incident-42', by: 'oncall', scopes: ['hitl'] });
+    const bypassed = await runtime.execute('drop', {}, { sessionId: 'h1' });
+    expect(bypassed.success).toBe(true);
+    expect(gate.pendingCount).toBe(0); // never asked
+    expect(
+      runtime.audit.trail().filter((e) => e.tool === 'drop').at(-1)!.findings,
+    ).toContain('BREAK_GLASS');
+    runtime.breakGlass.disable();
+
+    // Same call, override gone → the approval gate holds:
+    const pendingPromise = runtime.execute('drop', {}, { sessionId: 'h1' });
+    await vi.waitFor(() => expect(gate.pendingCount).toBe(1));
+    gate.deny(gate.getPendingRequests()[0]!.requestId, 'ops', 'no');
+    expect((await pendingPromise).blockedBy).toBe('HITL_DENIED');
+  });
+
+  it('expires automatically: the override lifts and the expiry is audited', async () => {
+    const runtime = makeEchoRuntime();
+    await runtime.execute('echo', { warm: 'up' }, { sessionId: 's2' }); // session must exist to freeze
+    expect(await runtime.freezeSession('s2', 'lock')).toBe(true);
+    runtime.breakGlass.enable({ reason: 'short fuse', by: 'x', scopes: ['anomaly'], durationMs: 40 });
+    expect((await runtime.execute('echo', { a: 1 }, { sessionId: 's2' })).success).toBe(true);
+
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(runtime.breakGlass.active).toBe(false);
+    expect((await runtime.execute('echo', { a: 1 }, { sessionId: 's2' })).blockedBy).toBe('SESSION_FROZEN');
+    expect(runtime.audit.trail().some((e) => e.findings.includes('BREAK_GLASS_EXPIRED'))).toBe(true);
   });
 });

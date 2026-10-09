@@ -296,6 +296,18 @@ idle longer than the TTL — halted and frozen sessions are always retained
 so an attacker cannot reset a velocity limit by making blocked calls. Input
 tokens are charged at gate 1; output tokens are charged after a successful run.
 
+**Break-glass (since 0.2.0-beta.3).** `runtime.breakGlass.enable({ reason, by })`
+lets an operator time-box an override of this gate's *operational* refusals —
+a frozen or halted session resumes executing while counters keep recording
+(the trail still shows what happened). The override carries scopes
+(`'anomaly'` for this gate, `'hitl'` for gate 5), defaults to 5 minutes
+(capped by `breakGlass.maxDurationMs`, default 15 min), and every transition
+(`enabled`/`disabled`/`expired`) is appended to the audit trail as its own
+entry; each call executed under it carries a `BREAK_GLASS` finding. Detection
+gates — capability sandbox, circuit breaker, schema, DLP, injection filter,
+execution timeout, audit durability — are **never** bypassed.
+See [CONFIGURATION.md](CONFIGURATION.md#break-glass) for the full contract.
+
 ### Gate 2 — Capability Sandbox
 
 **File:** `sandbox.ts` · **Config:** `CapabilityConfig` · **Refusal:** `CAPABILITY_VIOLATION`
@@ -511,7 +523,18 @@ data = await withTimeout(
   `hitl.gate.requestApproval(...)`. Denials refuse with
   `blockedBy: 'HITL_DENIED'`; undecided requests expire into denials after
   `hitl.timeoutMs` (default 60 s) — fail-closed, with the pending timer
-  always cleared.
+  always cleared. Since 0.2.0-beta.3 the gate also supports **approval
+  quorums** (`new HitlGate({ quorum: { required: N, approvers: [...] } })` —
+  N distinct approvers, one vote each, while a single denial always vetoes)
+  and **HMAC-signed webhook fan-out** (`webhook: { url, secret?, required? }`
+  POSTs `hitl.approval.requested` with the quorum context; a delivery failure
+  denies outright only when `required` is set, otherwise the request stays
+  pending for in-band approvers). With `risk.escalateTier` configured, a
+  tool whose **adaptive risk** tier (§4.10) reaches the threshold pauses for
+  approval too via a synthetic capability, even when unmapped — refusals
+  elsewhere in the pipeline raise the score, clean runs relax it. Both this
+  approval and gate 1 are the gates **break-glass** can override (audited,
+  time-boxed; see [CONFIGURATION.md](CONFIGURATION.md#break-glass)).
 
 ### Gate 6 — Output DLP
 
@@ -624,6 +647,8 @@ const runtime = new VarkRuntime({ /* VarkConfig */ });
 | `audit` | `AuditLoggerConfig` | `{}` (enabled, 10 000 entries) | See §4.9 |
 | `schema` | `SchemaValidationConfig` | `{}` (enabled, coercing) | Runtime JSON-Schema gate |
 | `hitl` | `HitlRuntimeConfig` | — | Human-in-the-loop: `{ gate, tools, timeoutMs? }` (§3 gate 5) |
+| `risk` | `AdaptiveRiskConfig` | `{}` | Adaptive per-tool risk: `{ tools, blockPenalty, escalateTier?, ... }` (§4.10) |
+| `breakGlass` | `BreakGlassRuntimeConfig` | `{}` (5 min / 15 min cap) | Break-glass duration limits (§4.10); audit wiring is internal |
 | `sessionId` | `string` | `'default'` (`DEFAULT_SESSION`) | Initial agent session |
 
 `VARK_*` environment variables fill any field the config leaves unset
@@ -962,7 +987,74 @@ Failures go to `onError`; with `failClosed: true` the next `write()` throws
 the previous failure while probing the collector — pair with `audit.failClosed`
 for a refuse-until-export-works runtime.
 
-### 4.10 Errors
+### 4.10 Adaptive risk and break-glass
+
+**Adaptive per-tool risk** (`runtime.risk`, an `AdaptiveRiskAssessor`). Every
+tool starts from a configured base score (`risk.tools[name]`, else
+`risk.defaultScore`, default 0) and adapts from observed outcomes:
+
+- every gate refusal adds `risk.blockPenalty` (default 25) — recorded
+  centrally by the refusal path, so refusals from any gate teach the assessor;
+- every completed call subtracts `risk.recoveryPerCleanRun` (default 5),
+  floored at the base — history escalates, recovery only returns to the
+  configured inherent risk (a destructive tool never drops below it);
+- signals age out after `risk.signalTtlMs` (default 5 min), so scrutiny
+  relaxes when behaviour improves — the adaptive part.
+
+Scores run 0–100 and map to tiers at `risk.tierThresholds` (`medium: 25,
+high: 50, critical: 75` by default):
+
+```ts
+const runtime = new VarkRuntime({
+  risk: { tools: { shell_exec: 40 }, escalateTier: 'high' },
+  hitl: { gate, tools: {} },
+});
+runtime.risk.assess('shell_exec');
+// { tool, score, tier, base, penalty, reasons } — reasons quotes live signals
+```
+
+Setting `risk.escalateTier` (with a `hitl` gate present — otherwise the
+runtime warns once at construction) makes gate 4b pause any unmapped tool
+whose tier reaches the threshold, via a synthetic capability (`risk:<tool>`,
+description quoting score and tier). The mapping in `hitl.tools` still
+applies first; escalation is additive. `runtime.risk.recordBlock(tool,
+reason)` / `recordCleanRun(tool)` / `reset(tool?)` let integrators feed or
+clear signals directly.
+
+**Break-glass** (`runtime.breakGlass`, a `BreakGlassManager`) is the
+deliberate, time-boxed operator override for when *operational* gates are
+what's taking production down:
+
+```ts
+runtime.breakGlass.enable({
+  reason: 'incident-42: approver rota offline',   // required, audited verbatim
+  by: 'oncall-1',                                  // required, audited
+  scopes: ['anomaly', 'hitl'],                     // default: both
+  durationMs: 600_000,                             // default 5 min, capped at 15
+});
+runtime.breakGlass.isBypassing('anomaly'); // true while active
+runtime.breakGlass.status();               // { active, session, remainingMs }
+runtime.breakGlass.disable();              // end early (returns the session)
+```
+
+| Scope | Bypasses |
+| --- | --- |
+| `'anomaly'` | Gate 1's operational refusals: frozen/halted sessions and loop/velocity/budget refusals resume executing (counters keep recording, so the trail still shows what the session did) |
+| `'hitl'` | Gate 5 approval waits for mapped **and** risk-escalated tools |
+
+Enabling while one is active throws (disable first — each activation is its
+own audited decision), as do missing `reason`/`by`, unknown scopes and
+non-positive durations; `durationMs` is clamped to `breakGlass.maxDurationMs`
+(default 15 min) and expiry runs on an `unref`'d timer. **Detection gates are
+never bypassed** — capability sandbox, circuit breaker, schema validation,
+DLP, injection filter, execution timeout and audit durability stay armed, so
+break-glass opens the doors between humans and the system without blinding
+the system to attackers. Every transition is appended to the audit trail as
+its own entry (`sessionId: 'break-glass'`, findings `BREAK_GLASS_ENABLED` /
+`_DISABLED` / `_EXPIRED`), and every call executed under the override carries
+a `BREAK_GLASS` finding in its own audit record.
+
+### 4.11 Errors
 
 Thrown **inside** `run()` / the sandbox (never out of `execute()`):
 
@@ -973,7 +1065,7 @@ Thrown **inside** `run()` / the sandbox (never out of `execute()`):
 | `CapabilityViolationError` | `CAPABILITY_VIOLATION` | `ctx.sandbox.*` denied a call |
 | `VarkTimeoutError` | `TIMEOUT` | `maxExecutionMs` elapsed |
 
-### 4.11 Complete export surface
+### 4.12 Complete export surface
 
 ```ts
 // runtime & configuration
@@ -1042,8 +1134,16 @@ checkPathAllowed, checkHostAllowed, assertPathAllowed, assertNetworkAllowed,
 normalizePath
 
 // human-in-the-loop (gate 4b)
-HitlGate, DEFAULT_HITL_CAPABILITIES
-type HitlCapability, HitlRequest, HitlConfig, HitlDecision
+HitlGate, DEFAULT_HITL_CAPABILITIES, signWebhookBody, verifyWebhookSignature
+type HitlCapability, HitlRequest, HitlConfig, HitlDecision,
+HitlDecisionRecord, HitlQuorum, HitlWebhookTarget
+
+// adaptive risk & break-glass (gate 1 adjunct, gate 4b escalation)
+AdaptiveRiskAssessor, tierForScore, tierAtLeast, BreakGlassManager
+type AdaptiveRiskConfig, RiskTier, RiskSignal, RiskAssessment,
+BreakGlassConfig, BreakGlassScope, BreakGlassEventType, BreakGlassEvent,
+BreakGlassEnableOptions, BreakGlassSession, BreakGlassStatus,
+BreakGlassRuntimeConfig
 
 // enterprise modules
 ResourceQuota,                                            // subprocess/memory quotas

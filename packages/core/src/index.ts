@@ -72,6 +72,18 @@ export {
 export type { PolicySignature, VerifyResult } from './policy-signature.js';
 export { diffPolicy } from './policy-diff.js';
 export type { PolicyDiffEntry } from './policy-diff.js';
+export { AdaptiveRiskAssessor, tierForScore, tierAtLeast } from './adaptive-risk.js';
+export type { AdaptiveRiskConfig, RiskTier, RiskSignal, RiskAssessment } from './adaptive-risk.js';
+export { BreakGlassManager } from './break-glass.js';
+export type {
+  BreakGlassConfig,
+  BreakGlassScope,
+  BreakGlassEventType,
+  BreakGlassEvent,
+  BreakGlassEnableOptions,
+  BreakGlassSession,
+  BreakGlassStatus,
+} from './break-glass.js';
 
 export {
   executeIsolated,
@@ -142,6 +154,7 @@ export type {
   AuditEntry,
   AuditLoggerConfig,
   BlockedBy,
+  BreakGlassRuntimeConfig,
   CapabilityConfig,
   CircuitBreakerConfig,
   DlpConfig,

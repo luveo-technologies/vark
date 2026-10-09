@@ -23,8 +23,10 @@ that fail to parse are ignored rather than throwing
 | `VARK_STRICT_DECODE` | `circuitBreaker.strictDecode` | Refuse any argument that decodes from an explicit encoding | `false` |
 | `VARK_SIEM_WEBHOOK_URL` | `vark audit tail --alert` | Webhook that alert entries are POSTed to | — |
 
-HITL approvals and canary seeding are programmatic APIs (`VarkConfig.hitl`,
-the canary module) — there is no environment toggle for them.
+HITL approvals, adaptive risk and canary seeding are programmatic APIs
+(`VarkConfig.hitl`, `VarkConfig.risk`, the canary module) — there is no
+environment toggle for them, and none exists for break-glass either: it must
+be an explicit, audited `runtime.breakGlass.enable(...)` call.
 
 ## VarkConfig
 
@@ -84,6 +86,23 @@ interface VarkConfig {
     gate: HitlGate;                 // holds capabilities + pending approvals
     tools: Record<string, string>;  // tool name → capability id
     timeoutMs?: number;             // default: 60_000 (fail-closed)
+  };
+
+  // Adaptive per-tool risk (see AdaptiveRiskConfig)
+  risk?: {
+    tools?: Record<string, number>; // per-tool base scores, 0–100
+    defaultScore?: number;          // default: 0
+    blockPenalty?: number;          // per gate refusal, default: 25
+    recoveryPerCleanRun?: number;   // per clean run, default: 5
+    signalTtlMs?: number;           // default: 300_000
+    tierThresholds?: { medium: number; high: number; critical: number };
+    escalateTier?: 'low' | 'medium' | 'high' | 'critical'; // requires hitl
+  };
+
+  // Break-glass limits (audited operator override — see Break-glass)
+  breakGlass?: {
+    maxDurationMs?: number;         // default: 900_000 (15 min)
+    defaultDurationMs?: number;     // default: 300_000 (5 min)
   };
 
   // Audit
@@ -207,6 +226,117 @@ node-redis users wrap `eval` once (different argument shape):
 ```ts
 client: { eval: (script, n, ...a) => redis.eval(script, { keys: a.slice(0, n), arguments: a.slice(n) }) },
 ```
+
+## HitlGate
+
+`HitlGate` is constructed as a runtime *value* and handed to
+`VarkConfig.hitl`, so quorum/webhook options belong to its constructor:
+
+```ts
+const gate = new HitlGate({
+  requiredCapabilities: DEFAULT_HITL_CAPABILITIES,
+  defaultTtlMs: 300_000,               // request lifetime
+  autoApprove: (req) => req.capability.risk === 'low',
+  quorum: {                            // approval quorum (optional)
+    required: 2,                       // distinct approvers
+    approvers: ['alice', 'bob'],       // whitelist; omit to allow anyone
+  },
+  webhook: {                           // outbound fan-out (optional)
+    url: 'https://approvals.example/hitl',
+    secret: process.env.HITL_WEBHOOK_SECRET, // HMAC-SHA256 → x-vark-signature: sha256=<hex>
+    headers: { authorization: `Bearer ${token}` },
+    timeoutMs: 5_000,
+    required: false,                   // true: a delivery failure denies the request
+  },
+  onWebhookError: (err, request) => metrics.count('hitl_webhook_failed'),
+});
+```
+
+Decision rules — every one of them fail-closed:
+
+| Rule | Behaviour |
+| --- | --- |
+| Quorum | `quorum.required` **distinct** approvers must approve; one approver, one vote (a repeat vote returns `false` and is not counted) |
+| Denial | A single `gate.deny(...)` vetoes regardless of quorum — approval needs consensus, refusal needs one voice |
+| Timeout | Undecided requests expire into denials (`hitl.timeoutMs`, default 60 s); timers are always cleared on settle |
+| Whitelist | With `quorum.approvers` configured, only listed ids may approve **or** deny |
+| Webhook | A delivery failure denies only when `webhook.required: true`; otherwise the request stays pending for in-band approvers |
+| Ledger | `gate.getDecisions(requestId)` returns `{ by, approved, at, reason }[]`; when quorum settles approval, `request.decidedBy` reads `alice+bob` |
+
+Webhooks are **outbound notifications** — responders call back through your
+control plane (`gate.approve(requestId, approverId)` /
+`gate.deny(requestId, approverId)`; there is no built-in HTTP server).
+Receivers verify the body with `verifyWebhookSignature(secret, body, header)`,
+or re-derive the HMAC via `signWebhookBody(secret, body)`.
+
+## AdaptiveRiskConfig
+
+```ts
+interface AdaptiveRiskConfig {
+  tools?: Record<string, number>;   // per-tool base scores, 0–100
+  defaultScore?: number;            // base for unlisted tools, default: 0
+  blockPenalty?: number;            // added per gate refusal, default: 25
+  recoveryPerCleanRun?: number;     // given back per clean run, default: 5
+  signalTtlMs?: number;             // signal lifetime, default: 300_000
+  tierThresholds?: {                // inclusive score → tier cut points
+    medium: number; high: number; critical: number; // default: 25 / 50 / 75
+  };
+  escalateTier?: 'low' | 'medium' | 'high' | 'critical';
+}
+```
+
+Score = base + live signals, **floored at the base** and capped at 100 —
+history can only escalate a tool above its configured inherent risk; clean
+runs walk it back down to (never below) the base, and signals expire after
+`signalTtlMs`. Read it with `runtime.risk.assess(tool)` →
+`{ score, tier, base, penalty, reasons }`.
+
+`escalateTier` (requires `VarkConfig.hitl`; the runtime warns once at
+construction otherwise) makes gate 4b pause any **unmapped** tool whose tier
+reaches the threshold, via synthetic capability `risk:<tool>` — tools mapped
+in `hitl.tools` behave exactly as before. The runtime feeds the assessor
+automatically (refusals from any gate raise the score, completed calls
+relax it); integrators can also call `runtime.risk.recordBlock(tool, reason)`,
+`recordCleanRun(tool)` or `reset(tool?)` directly.
+
+## Break-glass
+
+A deliberate, time-boxed operator override for when Vark's *operational*
+gates are what's taking production down (approver rota offline, a session
+frozen by a bad config, an incident where a human has decided the agent must
+proceed). Activation is programmatic, per-runtime and fully audited — by
+design there is no environment variable or config flag that silently
+enables it.
+
+```ts
+runtime.breakGlass.enable({
+  reason: 'incident-42: approver rota offline', // required, audited verbatim
+  by: 'oncall-1',                                // required, audited
+  scopes: ['anomaly', 'hitl'],                   // default: both
+  durationMs: 600_000,                           // default 300_000, clamped to maxDurationMs
+});
+```
+
+| Scope | What it bypasses |
+| --- | --- |
+| `'anomaly'` | Gate 1: frozen/halted sessions and loop/velocity/budget refusals resume executing — counters keep recording, so the trail still shows what the session did |
+| `'hitl'` | Gate 5: approval waits for mapped **and** risk-escalated tools |
+
+Contract:
+
+- `VarkConfig.breakGlass` tunes `defaultDurationMs` (default 5 min) and
+  `maxDurationMs` (default 15 min); longer requests are clamped, not rejected.
+- Enabling while one is active, missing `reason`/`by`, unknown scopes and
+  non-positive durations **throw**. `disable()` ends it early (returns the
+  session), expiry runs on an `unref`'d timer, and `status()` reports
+  `remainingMs`.
+- Detection gates are **never** bypassed: capability sandbox, circuit
+  breaker, schema validation, DLP, injection filter, execution timeout and
+  audit durability stay armed.
+- Audit: every transition is appended as its own entry
+  (`sessionId: 'break-glass'`, findings `BREAK_GLASS_ENABLED` /
+  `BREAK_GLASS_DISABLED` / `BREAK_GLASS_EXPIRED`), and each call executed
+  under the override carries a `BREAK_GLASS` finding in its own record.
 
 ## DlpConfig
 

@@ -5,6 +5,8 @@
  * result of a guarded execution.
  */
 
+import type { AdaptiveRiskConfig } from './adaptive-risk.js';
+import type { BreakGlassConfig } from './break-glass.js';
 import type { HitlGate } from './gates/hitl-gate.js';
 import type { StateStore } from './state-store.js';
 
@@ -241,9 +243,27 @@ export interface VarkConfig {
    * refuse with `blockedBy: 'HITL_DENIED'`.
    */
   hitl?: HitlRuntimeConfig;
+  /**
+   * Adaptive per-tool risk scoring: refusals raise a tool's score, clean
+   * runs relax it, and (with `risk.escalateTier` + a `hitl` gate) an
+   * elevated tool pauses for approval even when unmapped.
+   */
+  risk?: AdaptiveRiskConfig;
+  /**
+   * Break-glass limits (time-boxed operator override for the HITL and
+   * anomaly gates; detection gates are never bypassed). Every transition
+   * is appended to the audit trail.
+   */
+  breakGlass?: BreakGlassRuntimeConfig;
   /** Initial agent session id. @default 'default' */
   sessionId?: string;
 }
+
+/**
+ * Break-glass settings visible in `VarkConfig` — the runtime owns the
+ * `onEvent` audit wiring, so users configure durations only.
+ */
+export type BreakGlassRuntimeConfig = Omit<BreakGlassConfig, 'onEvent'>;
 
 /** A tool exposed to the agent, guarded by vark. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- `any` defaults are deliberate: `unknown` would break contextual inference for consumers writing `run: (args) => args.path`. Explicit type arguments still narrow.
