@@ -22,6 +22,7 @@ that fail to parse are ignored rather than throwing
 | `VARK_MAX_DECODE_DEPTH` | `circuitBreaker.maxDecodeDepth` | Recursive decode depth for encoded-payload detection | `5` |
 | `VARK_STRICT_DECODE` | `circuitBreaker.strictDecode` | Refuse any argument that decodes from an explicit encoding | `false` |
 | `VARK_SIEM_WEBHOOK_URL` | `vark audit tail --alert` | Webhook that alert entries are POSTed to | — |
+| `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` | read by `ctx.sandbox.fetch` directly (not `applyEnvOverrides`) | Standard curl-compatible forward-proxy vars, honoured when `VarkConfig.proxy` is unset — see ProxyConfig | — |
 
 HITL approvals, adaptive risk and canary seeding are programmatic APIs
 (`VarkConfig.hitl`, `VarkConfig.risk`, the canary module) — there is no
@@ -104,6 +105,10 @@ interface VarkConfig {
     maxDurationMs?: number;         // default: 900_000 (15 min)
     defaultDurationMs?: number;     // default: 300_000 (5 min)
   };
+
+  // Corporate forward proxy for ctx.sandbox.fetch — see ProxyConfig.
+  // Unset = honour HTTP_PROXY/HTTPS_PROXY/NO_PROXY; false = direct only.
+  proxy?: ProxyConfig | false;
 
   // Audit
   audit?: {
@@ -433,6 +438,41 @@ interface SiemConfig {
   customSender?: (events: SiemEvent[]) => Promise<void>;
 }
 ```
+
+## ProxyConfig
+
+Corporate forward-proxy transport for `ctx.sandbox.fetch` — for networks
+that only allow egress through Squid/Zscaler-style forward proxies.
+
+```ts
+interface ProxyConfig {
+  url?: string;              // e.g. http://user:pass@proxy.corp:3128
+  noProxy?: string | string[]; // hosts that bypass the proxy
+  useEnv?: boolean;          // read HTTP_PROXY/HTTPS_PROXY/NO_PROXY, default: true
+}
+```
+
+Resolution order when a sandboxed fetch runs:
+
+1. `VarkConfig.proxy === false` → **direct** egress; proxy env vars are
+   ignored entirely.
+2. `proxy.noProxy` (comma string or array) when set, otherwise `NO_PROXY`
+   from the environment, decides bypass: exact host or any subdomain
+   (`corp.com` matches `api.corp.com`), optional `:port`, `*.` / `.`
+   prefixes, `*` bypasses everything.
+3. `proxy.url` when set (scheme-less values default to `http://`), otherwise
+   `HTTPS_PROXY` → `HTTP_PROXY` for `https://` targets and `HTTP_PROXY` for
+   `http://` targets. Credentials in the URL become a `Proxy-Authorization`
+   Basic header — never a URL userinfo at the proxy hop.
+4. Nothing found → direct (unchanged from previous releases).
+
+`http://` requests are sent to the proxy in absolute-form; `https://`
+requests use a `CONNECT` tunnel with TLS negotiated end-to-end to the
+origin, so the proxy sees the destination host but never the payload.
+Capability allowlists and the SSRF baseline still run **before** any socket
+opens — a proxy changes *how* a permitted request travels, never *whether*
+it is allowed. A malformed or unsupported (e.g. `socks5://`) proxy URL
+**throws** rather than silently falling back to direct egress.
 
 ## Complete Example
 

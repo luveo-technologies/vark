@@ -3,6 +3,12 @@ import { mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { runCheck } from '../packages/core/src/cli/commands/check.js';
+import { proxiedFetch, resolveProxyFor, matchesNoProxy } from '../packages/core/src/proxy.js';
+import { createSandbox } from '../packages/core/src/sandbox.js';
+import { createServer, request as httpRequest } from 'node:http';
+import type { IncomingHttpHeaders } from 'node:http';
+import { connect as tcpConnect } from 'node:net';
+import type { AddressInfo, Socket } from 'node:net';
 import { runSessionReplay, printSessionReplay } from '../packages/core/src/cli/commands/ops.js';
 import { runAuditAnchor, printAuditAnchor, runAuditVerify } from '../packages/core/src/cli/commands/audit.js';
 import { createAuditAnchor, checkAuditAnchors, verifyAuditChain } from '../packages/core/src/audit-anchor.js';
@@ -24,7 +30,7 @@ import type { SessionRecord, StateStore } from '../packages/core/src/state-store
 import { RedisStateStore } from '../packages/core/src/redis-state-store.js';
 import { AnomalyGuard } from '../packages/core/src/anomaly-guard.js';
 import { VarkRuntime } from '../packages/core/src/index.js';
-import type { AuditEntry } from '../packages/core/src/types.js';
+import type { AuditEntry, CapabilityConfig } from '../packages/core/src/types.js';
 
 /**
  * 0.2.0-beta.3 suite — enterprise-readiness round:
@@ -1719,5 +1725,388 @@ describe('vark audit anchor', () => {
     vi.stubEnv('VARK_AUDIT_HMAC_KEY', '');
     const withoutKey = await runAuditVerify(log);
     expect(withoutKey.valid).toBe(false); // fails closed without the key
+  });
+});
+
+// ── beta.3 additions: corporate proxy for ctx.sandbox.fetch ─────────────────
+
+describe('corporate proxy (ctx.sandbox.fetch)', () => {
+  beforeEach(() => {
+    // Deterministic env: no ambient proxy settings from the test host.
+    for (const key of [
+      'HTTP_PROXY',
+      'http_proxy',
+      'HTTPS_PROXY',
+      'https_proxy',
+      'NO_PROXY',
+      'no_proxy',
+    ]) {
+      vi.stubEnv(key, '');
+    }
+  });
+
+  interface TargetServer {
+    url: string;
+    seen: IncomingHttpHeaders[];
+    close: () => Promise<void>;
+  }
+
+  async function startTargetServer(): Promise<TargetServer> {
+    const seen: IncomingHttpHeaders[] = [];
+    const server = createServer((req, res) => {
+      seen.push(req.headers);
+      const chunks: Buffer[] = [];
+      req.on('data', (chunk: Buffer) => chunks.push(chunk));
+      req.on('end', () => {
+        res.writeHead(200, { 'content-type': 'application/json', 'x-target': '1' });
+        res.end(
+          JSON.stringify({
+            path: req.url,
+            method: req.method,
+            host: req.headers.host,
+            body: Buffer.concat(chunks).toString('utf8'),
+          }),
+        );
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as AddressInfo).port;
+    return {
+      url: `http://127.0.0.1:${port}`,
+      seen,
+      close: () =>
+        new Promise((resolve) => {
+          server.closeAllConnections();
+          server.close(() => resolve());
+        }),
+    };
+  }
+
+  interface MiniProxy {
+    url: string;
+    requests: Array<{ url?: string; headers: IncomingHttpHeaders }>;
+    connections: string[];
+    close: () => Promise<void>;
+  }
+
+  /** Minimal forward proxy: absolute-form forwarding + CONNECT tunnels. */
+  async function startMiniProxy(): Promise<MiniProxy> {
+    const requests: MiniProxy['requests'] = [];
+    const connections: string[] = [];
+    const sockets = new Set<Socket>();
+
+    const server = createServer((req, res) => {
+      requests.push({ url: req.url, headers: req.headers });
+      let target: URL;
+      try {
+        target = new URL(req.url ?? '');
+      } catch {
+        res.writeHead(400);
+        res.end();
+        return;
+      }
+      const forwardHeaders: IncomingHttpHeaders = { ...req.headers, host: target.host };
+      delete forwardHeaders['proxy-authorization']; // proxy-only credentials
+      delete forwardHeaders['proxy-connection'];
+      const upstream = httpRequest(
+        {
+          hostname: target.hostname,
+          port: target.port || 80,
+          path: `${target.pathname}${target.search}`,
+          method: req.method,
+          headers: forwardHeaders,
+        },
+        (up) => {
+          const headers = { ...up.headers };
+          delete headers.connection;
+          delete headers['transfer-encoding'];
+          res.writeHead(up.statusCode ?? 502, headers);
+          up.pipe(res);
+        },
+      );
+      upstream.on('error', () => {
+        res.writeHead(502);
+        res.end();
+      });
+      req.pipe(upstream);
+    });
+
+    server.on('connect', (req, clientSocket, head) => {
+      connections.push(req.url ?? '');
+      const [host, port] = (req.url ?? '').split(':');
+      const upstream = tcpConnect(Number(port), host, () => {
+        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        if (head?.length) upstream.write(head);
+        upstream.pipe(clientSocket);
+        clientSocket.pipe(upstream);
+      });
+      upstream.on('error', () => clientSocket.destroy());
+      clientSocket.on('error', () => upstream.destroy());
+    });
+
+    server.on('connection', (socket) => {
+      sockets.add(socket);
+      socket.on('close', () => sockets.delete(socket));
+    });
+
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as AddressInfo).port;
+    return {
+      url: `http://127.0.0.1:${port}`,
+      requests,
+      connections,
+      close: () =>
+        new Promise((resolve) => {
+          for (const socket of sockets) socket.destroy();
+          server.close(() => resolve());
+        }),
+    };
+  }
+
+  it('resolveProxyFor: env selection, precedence and explicit credentials', () => {
+    vi.stubEnv('HTTP_PROXY', 'http://env-http:3128');
+    vi.stubEnv('HTTPS_PROXY', 'http://env-https:3128');
+    vi.stubEnv('NO_PROXY', 'internal.corp, .dev:8080');
+
+    // Scheme-dependent env selection.
+    expect(resolveProxyFor('https://api.example.com')?.url.host).toBe('env-https:3128');
+    expect(resolveProxyFor('http://api.example.com')?.url.host).toBe('env-http:3128');
+    vi.stubEnv('HTTPS_PROXY', ''); // https falls back to HTTP_PROXY
+    expect(resolveProxyFor('https://api.example.com')?.url.host).toBe('env-http:3128');
+
+    // NO_PROXY: exact, subdomain, port-qualified.
+    expect(resolveProxyFor('http://internal.corp/x')).toBeUndefined();
+    expect(resolveProxyFor('http://api.internal.corp/x')).toBeUndefined();
+    expect(resolveProxyFor('http://box.dev/x')).toBeDefined(); // port 80 ≠ 8080
+    expect(resolveProxyFor('http://box.dev:8080/x')).toBeUndefined();
+    expect(resolveProxyFor('https://api.example.com/x')).toBeDefined();
+
+    // Explicit config wins over env; scheme-less normalises to http://.
+    const explicit = resolveProxyFor('https://api.example.com', { url: 'proxy.corp:8888' });
+    expect(explicit?.url.toString()).toBe('http://proxy.corp:8888/');
+
+    // config.noProxy replaces (does not merge with) NO_PROXY.
+    expect(
+      resolveProxyFor('http://internal.corp/x', { noProxy: 'other.corp' })?.url.host,
+    ).toBe('env-http:3128');
+
+    // Credentials → Proxy-Authorization header, stripped from the endpoint.
+    const cred = resolveProxyFor('http://api.example.com', {
+      url: 'http://user:p%40ss@proxy:3128',
+    });
+    expect(cred?.auth).toBe(`Basic ${Buffer.from('user:p@ss').toString('base64')}`);
+    expect(cred?.url.username).toBe('');
+    expect(cred?.url.password).toBe('');
+
+    // Disable / opt-out.
+    expect(resolveProxyFor('https://api.example.com', false)).toBeUndefined();
+    expect(resolveProxyFor('https://api.example.com', { useEnv: false })).toBeUndefined();
+
+    // Fail-closed on misconfiguration (silently going direct would bypass policy).
+    expect(() => resolveProxyFor('https://api.example.com', { url: 'http://' })).toThrow(
+      /invalid proxy url/,
+    );
+    expect(() => resolveProxyFor('https://api.example.com', { url: 'socks5://p:1080' })).toThrow(
+      /unsupported proxy scheme/,
+    );
+    vi.stubEnv('HTTP_PROXY', 'not a url');
+    expect(() => resolveProxyFor('http://api.example.com')).toThrow(/environment/);
+  });
+
+  it('matchesNoProxy: hosts, subdomains, ports, wildcards and IPv6', () => {
+    expect(matchesNoProxy('corp.com', 443, ['corp.com'])).toBe(true);
+    expect(matchesNoProxy('api.corp.com', 443, ['corp.com'])).toBe(true);
+    expect(matchesNoProxy('corp.com', 443, ['.corp.com'])).toBe(true);
+    expect(matchesNoProxy('corp.com.evil.com', 443, ['corp.com'])).toBe(false);
+    expect(matchesNoProxy('host', 8080, ['host:8080'])).toBe(true);
+    expect(matchesNoProxy('host', 80, ['host:8080'])).toBe(false);
+    expect(matchesNoProxy('anything', 443, ['*'])).toBe(true);
+    expect(matchesNoProxy('[::1]', 80, ['::1'])).toBe(true);
+    expect(matchesNoProxy('svc.other', 80, ['svc'])).toBe(false);
+    expect(matchesNoProxy('svc', 80, ['svc'])).toBe(true);
+  });
+
+  it('proxiedFetch routes http targets through the proxy in absolute-form', async () => {
+    const proxy = await startMiniProxy();
+    const target = await startTargetServer();
+    try {
+      const response = await proxiedFetch(
+        `${target.url}/hello?q=1`,
+        { method: 'POST', headers: { 'x-custom': 'yes' }, body: JSON.stringify({ a: 1 }) },
+        { url: proxy.url },
+      );
+      expect(response.status).toBe(200);
+      expect(response.headers.get('x-target')).toBe('1');
+
+      const payload = (await response.json()) as {
+        path: string;
+        method: string;
+        host: string;
+        body: string;
+      };
+      expect(payload.path).toBe('/hello?q=1');
+      expect(payload.method).toBe('POST');
+      expect(payload.body).toBe('{"a":1}');
+      expect(payload.host).toBe(new URL(target.url).host);
+
+      expect(proxy.requests).toHaveLength(1);
+      const seen = proxy.requests[0]!;
+      expect(seen.url).toBe(`${target.url}/hello?q=1`); // absolute-form
+      expect(seen.headers.host).toBe(new URL(target.url).host);
+      expect(seen.headers['x-custom']).toBe('yes');
+    } finally {
+      await proxy.close();
+      await target.close();
+    }
+  });
+
+  it('sends Proxy-Authorization from proxy URL credentials (never forwarded)', async () => {
+    const proxy = await startMiniProxy();
+    const target = await startTargetServer();
+    try {
+      const auth = `Basic ${Buffer.from('user:pass').toString('base64')}`;
+      const proxyHost = new URL(proxy.url).host;
+      const response = await proxiedFetch(`${target.url}/auth`, undefined, {
+        url: `http://user:pass@${proxyHost}`,
+      });
+      expect(response.status).toBe(200);
+      await response.text();
+      expect(proxy.requests[0]!.headers['proxy-authorization']).toBe(auth);
+      // The origin must never see the proxy credentials.
+      for (const headers of target.seen) {
+        expect(headers['proxy-authorization']).toBeUndefined();
+      }
+    } finally {
+      await proxy.close();
+      await target.close();
+    }
+  });
+
+  it('NO_PROXY bypasses the proxy entirely', async () => {
+    const proxy = await startMiniProxy();
+    const target = await startTargetServer();
+    try {
+      vi.stubEnv('HTTP_PROXY', proxy.url);
+      vi.stubEnv('NO_PROXY', new URL(target.url).hostname);
+      const response = await proxiedFetch(`${target.url}/direct`);
+      expect(response.status).toBe(200);
+      await response.text();
+      expect(proxy.requests).toHaveLength(0);
+    } finally {
+      await proxy.close();
+      await target.close();
+    }
+  });
+
+  it('https targets get a CONNECT tunnel — refusals fail closed with a hint', async () => {
+    const refuse = async (statusLine: string): Promise<string> => {
+      const server = createServer();
+      server.on('connect', (_req, socket) => socket.end(statusLine));
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const port = (server.address() as AddressInfo).port;
+      try {
+        await proxiedFetch('https://example.invalid/', undefined, {
+          url: `http://127.0.0.1:${port}`,
+        });
+        throw new Error('expected the CONNECT to be refused');
+      } catch (error) {
+        return error instanceof Error ? error.message : String(error);
+      } finally {
+        server.closeAllConnections();
+        server.close();
+      }
+    };
+
+    const refused = await refuse('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+    expect(refused).toMatch(/CONNECT to example\.invalid:443 refused: 502/);
+
+    const unauthenticated = await refuse('HTTP/1.1 407 Proxy Authentication Required\r\n\r\n');
+    expect(unauthenticated).toMatch(/407 Proxy Authentication Required — put credentials/);
+  });
+
+  it('createSandbox fetch honours the proxy; capability guards still run first', async () => {
+    const proxy = await startMiniProxy();
+    const target = await startTargetServer();
+    try {
+      const capabilities: CapabilityConfig = {
+        network: { allowPrivate: true, allowedHosts: [new URL(target.url).hostname] },
+      };
+      const sandbox = createSandbox(capabilities, { url: proxy.url });
+      const response = await sandbox.fetch(`${target.url}/through-sandbox`);
+      expect(response.status).toBe(200);
+      await response.text();
+      expect(proxy.requests).toHaveLength(1);
+
+      // network:false refuses before any socket — the proxy never sees it.
+      const denied = createSandbox({ network: false }, { url: proxy.url });
+      await expect(denied.fetch(`${target.url}/nope`)).rejects.toThrow(/network/i);
+      expect(proxy.requests).toHaveLength(1);
+    } finally {
+      await proxy.close();
+      await target.close();
+    }
+  });
+
+  it('threads through VarkConfig.proxy — and proxy env vars work without config', async () => {
+    const proxy = await startMiniProxy();
+    const target = await startTargetServer();
+    const grab = {
+      name: 'grab',
+      description: 'fetch a url',
+      schema: { type: 'object', properties: {} },
+      run: async (_args: unknown, ctx: { sandbox: { fetch: (u: string) => Promise<Response> } }) =>
+        (await ctx.sandbox.fetch(`${target.url}/cfg`)).status,
+    };
+    try {
+      const runtime = new VarkRuntime({
+        proxy: { url: proxy.url },
+        defaultCapabilities: { network: { allowPrivate: true, allowedHosts: ['127.0.0.1'] } },
+      });
+      runtime.tool(grab);
+      const explicit = await runtime.execute('grab', {});
+      expect(explicit.blockedBy).toBeUndefined();
+      expect(explicit.data).toBe(200);
+      expect(proxy.requests).toHaveLength(1);
+      expect(proxy.requests[0]!.url).toContain('/cfg');
+
+      // The corporate default: no config at all, just HTTP_PROXY in the env.
+      vi.stubEnv('HTTP_PROXY', proxy.url);
+      const envRuntime = new VarkRuntime({
+        defaultCapabilities: { network: { allowPrivate: true, allowedHosts: ['127.0.0.1'] } },
+      });
+      envRuntime.tool(grab);
+      const viaEnv = await envRuntime.execute('grab', {});
+      expect(viaEnv.blockedBy).toBeUndefined();
+      expect(viaEnv.data).toBe(200);
+      expect(proxy.requests).toHaveLength(2);
+    } finally {
+      await proxy.close();
+      await target.close();
+    }
+  });
+
+  it('tunnels https end-to-end (TLS verified against the origin)', async ({ skip }) => {
+    // The tunnel's happy path needs a real TLS origin; probe for outbound
+    // network first so offline environments skip instead of failing.
+    try {
+      await globalThis.fetch('https://example.com/', {
+        redirect: 'manual',
+        signal: AbortSignal.timeout(4000),
+      });
+    } catch {
+      skip();
+      return;
+    }
+
+    const proxy = await startMiniProxy();
+    try {
+      const response = await proxiedFetch('https://example.com/', undefined, { url: proxy.url });
+      expect(response.status).toBeGreaterThanOrEqual(200);
+      expect(response.status).toBeLessThan(400);
+      expect(proxy.connections).toEqual(['example.com:443']); // only the proxy was dialled
+      await response.body?.cancel();
+    } finally {
+      await proxy.close();
+    }
   });
 });

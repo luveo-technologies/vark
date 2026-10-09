@@ -149,6 +149,9 @@ export {
   withTimeout,
 } from './sandbox.js';
 
+export { proxiedFetch, resolveProxyFor, matchesNoProxy } from './proxy.js';
+export type { ResolvedProxy } from './proxy.js';
+
 export {
   CapabilityViolationError,
   CircuitBreakerError,
@@ -173,6 +176,7 @@ export type {
   IndirectInjectionConfig,
   InspectionResult,
   IsolationMode,
+  ProxyConfig,
   SchemaValidationConfig,
   ToolDefinition,
   ToolExecutionResult,

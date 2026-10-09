@@ -12,7 +12,8 @@ import { readFile as fsReadFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
 import { checkEgress, checkEgressSync } from './security/network/ssrf-guard.js';
-import type { CapabilityConfig, ExecutionContext, InspectionResult } from './types.js';
+import { proxiedFetch } from './proxy.js';
+import type { CapabilityConfig, ExecutionContext, InspectionResult, ProxyConfig } from './types.js';
 import { CapabilityViolationError, VarkTimeoutError } from './types.js';
 
 /** Fallback wall-clock budget when neither tool nor runtime declares one. */
@@ -271,18 +272,19 @@ async function fetchWithRevalidation(
   url: string,
   init: RequestInit | undefined,
   capabilities: CapabilityConfig | undefined,
+  proxy?: ProxyConfig | false,
 ): Promise<Response> {
   let current = url;
   let method = (init?.method ?? 'GET').toUpperCase();
   let body: BodyInit | null | undefined = init?.body;
 
   for (let hop = 0; hop <= MAX_FETCH_REDIRECTS; hop += 1) {
-    const response = await globalThis.fetch(current, {
+    const response = await proxiedFetch(current, {
       ...init,
       method,
       body: body ?? undefined,
       redirect: 'manual',
-    });
+    }, proxy);
     if (!REDIRECT_STATUSES.has(response.status)) return response;
 
     const location = response.headers.get('location');
@@ -326,8 +328,15 @@ async function fetchWithRevalidation(
   throw new CapabilityViolationError(`egress exceeded ${MAX_FETCH_REDIRECTS} redirects`);
 }
 
-/** Build the privileged host services handed to `run()`. */
-export function createSandbox(capabilities?: CapabilityConfig): ExecutionContext['sandbox'] {
+/**
+ * Build the privileged host services handed to `run()`. `proxy` is the
+ * resolved `VarkConfig.proxy` — the transport for `fetch` (capability and
+ * SSRF checks above it are unchanged).
+ */
+export function createSandbox(
+  capabilities?: CapabilityConfig,
+  proxy?: ProxyConfig | false,
+): ExecutionContext['sandbox'] {
   return {
     async readFile(path: string): Promise<string> {
       assertPathAllowed(path, capabilities);
@@ -342,7 +351,7 @@ export function createSandbox(capabilities?: CapabilityConfig): ExecutionContext
       if (!egress.allowed) {
         throw new CapabilityViolationError(egress.reason ?? `egress refused for "${url}"`);
       }
-      return fetchWithRevalidation(url, init, capabilities);
+      return fetchWithRevalidation(url, init, capabilities, proxy);
     },
   };
 }

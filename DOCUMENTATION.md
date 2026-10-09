@@ -360,6 +360,20 @@ can never reach a target the original URL could not. Set
 `network.allowPrivate` to permit local targets (metadata endpoints stay
 blocked regardless).
 
+**Corporate proxy (since 0.2.0-beta.3).** `ctx.sandbox.fetch` transports
+permitted requests through a forward proxy when one is configured:
+`VarkConfig.proxy = { url, noProxy?, useEnv? }`, or — with no config — the
+standard `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` environment variables
+(curl-compatible). `http://` targets go to the proxy absolute-form;
+`https://` targets get a `CONNECT` tunnel with TLS negotiated end-to-end to
+the origin, so the proxy sees *where* the agent talks but never *what* it
+says. Proxy URL credentials become a `Proxy-Authorization` header.
+`proxy: false` forces direct egress and ignores the env vars; a malformed
+proxy URL throws (fail-closed — silently going direct would bypass
+corporate policy). Transport is orthogonal to authorisation: the grants
+table and baseline above still decide *whether* the request may happen.
+Full semantics in `docs/CONFIGURATION.md` → ProxyConfig.
+
 **Defence in depth.** Gate 2 audits the *arguments*; the `ctx.sandbox` handed
 to `run()` re-checks *at the moment of use*:
 
@@ -661,6 +675,7 @@ const runtime = new VarkRuntime({ /* VarkConfig */ });
 | `hitl` | `HitlRuntimeConfig` | — | Human-in-the-loop: `{ gate, tools, timeoutMs? }` (§3 gate 5) |
 | `risk` | `AdaptiveRiskConfig` | `{}` | Adaptive per-tool risk: `{ tools, blockPenalty, escalateTier?, ... }` (§4.10) |
 | `breakGlass` | `BreakGlassRuntimeConfig` | `{}` (5 min / 15 min cap) | Break-glass duration limits (§4.10); audit wiring is internal |
+| `proxy` | `ProxyConfig \| false` | env `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` if present, else direct | Corporate forward proxy for `ctx.sandbox.fetch`; `false` = direct only (§4.1) |
 | `sessionId` | `string` | `'default'` (`DEFAULT_SESSION`) | Initial agent session |
 
 `VARK_*` environment variables fill any field the config leaves unset
@@ -1146,6 +1161,10 @@ verifyFileIdentity, validateBinary, validateArgs, execFileSafe,
 containsShellMetacharacters, sanitizeArgForDisplay,
 checkPathAllowed, checkHostAllowed, assertPathAllowed, assertNetworkAllowed,
 normalizePath
+
+// corporate proxy transport (ctx.sandbox.fetch, β3)
+proxiedFetch, resolveProxyFor, matchesNoProxy
+type ProxyConfig, ResolvedProxy
 
 // human-in-the-loop (gate 4b)
 HitlGate, DEFAULT_HITL_CAPABILITIES, signWebhookBody, verifyWebhookSignature

@@ -50,6 +50,7 @@ import type {
   InspectionResult,
   IsolationConfig,
   IsolationMode,
+  ProxyConfig,
   SchemaValidationConfig,
   ToolDefinition,
   ToolExecutionResult,
@@ -97,6 +98,8 @@ export interface ResolvedVarkConfig {
   hitl?: HitlRuntimeConfig;
   risk: AdaptiveRiskConfig;
   breakGlass?: BreakGlassRuntimeConfig;
+  /** Corporate forward proxy for `ctx.sandbox.fetch` (`false` = direct only). */
+  proxy?: ProxyConfig | false;
 }
 
 export const DEFAULT_SESSION = 'default';
@@ -134,6 +137,7 @@ export class VarkRuntime {
       ...(cfg.hitl ? { hitl: cfg.hitl } : {}),
       risk: cfg.risk ?? {},
       ...(cfg.breakGlass ? { breakGlass: cfg.breakGlass } : {}),
+      ...(cfg.proxy !== undefined ? { proxy: cfg.proxy } : {}),
     };
     this.audit = new AuditLogger(this.config.audit);
     this.anomaly = new AnomalyGuard(this.config.anomaly);
@@ -575,7 +579,7 @@ export class VarkRuntime {
     let data: TResult;
     try {
       data = await withTimeout(
-        () => definition.run(safeArgs as TArgs, { sandbox: createSandbox(capabilities) }),
+        () => definition.run(safeArgs as TArgs, { sandbox: createSandbox(capabilities, this.config.proxy) }),
         capabilities.maxExecutionMs ?? DEFAULT_MAX_EXECUTION_MS,
       );
     } catch (error) {

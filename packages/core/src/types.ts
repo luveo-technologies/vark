@@ -29,6 +29,9 @@ export interface CapabilityConfig {
    * `ctx.sandbox.fetch` always refuses cloud-metadata endpoints, embedded
    * credentials, and non-http(s) schemes; loopback/RFC1918/link-local
    * targets are refused too unless `allowPrivate` is set (local-dev APIs).
+   * Transport-level `VarkConfig.proxy` (corporate forward proxy) is
+   * orthogonal: it changes *how* a permitted request travels, never
+   * *whether* it is allowed.
    */
   network?: boolean | {
     allowedHosts?: string[];
@@ -213,6 +216,29 @@ export interface HitlRuntimeConfig {
   timeoutMs?: number;
 }
 
+/**
+ * Corporate forward-proxy transport for `ctx.sandbox.fetch`.
+ * All fields optional — unset means "honour the standard
+ * `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment variables".
+ */
+export interface ProxyConfig {
+  /**
+   * Explicit forward proxy, e.g. `http://user:pass@proxy.corp:3128`.
+   * Scheme-less values default to `http://`. Wins over proxy env vars.
+   * Credentials travel as `Proxy-Authorization` (Basic), never in the URL.
+   */
+  url?: string;
+  /**
+   * Hosts that bypass the proxy: comma-separated string or array.
+   * Entries match an exact host or any subdomain, support `:port`,
+   * `*.` / `.` prefixes, and `*` (bypass everything). Replaces
+   * `NO_PROXY` when set.
+   */
+  noProxy?: string | string[];
+  /** Read proxy settings from the environment. @default true */
+  useEnv?: boolean;
+}
+
 /** Top-level runtime configuration. */
 export interface VarkConfig {
   /**
@@ -255,6 +281,13 @@ export interface VarkConfig {
    * is appended to the audit trail.
    */
   breakGlass?: BreakGlassRuntimeConfig;
+  /**
+   * Corporate forward proxy for `ctx.sandbox.fetch`. Unset honours the
+   * standard `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment variables
+   * (curl-compatible); set an object for explicit control; `false` forces
+   * direct egress and ignores proxy environment variables entirely.
+   */
+  proxy?: ProxyConfig | false;
   /** Initial agent session id. @default 'default' */
   sessionId?: string;
 }
