@@ -612,6 +612,18 @@ hash(n) = HMAC-SHA256( key, stableStringify(...) )                // when audit.
 reproducible. Records are `Object.freeze`d and there is **no update API** —
 editing, reordering or dropping a record makes `verify()` fail at that `seq`.
 
+**Anchors (since 0.2.0-beta.3).** Both `verify()` and `vark audit verify`
+recompute the chain *from the record the log starts at*, so they localise
+tampering but cannot see records that are **gone** — a ring-buffer trim, a
+`head`-ed log and an attacker's suffix truncation all look identical from
+inside. `createAuditAnchor` pins a record (normally the head) as
+`{ seq, hash, anchoredAt, totalEntries }` **outside** the log — a sidecar
+file you ship elsewhere, optionally POSTed to a webhook witness — and
+`checkAuditAnchors` later compares the log against that pin, reporting
+`truncated`, `hash-mismatch` (record rewritten after anchoring) or
+`broken-chain`. Verification is fail-closed: a broken chain is never
+attested. CLI: `vark audit anchor <log>` / `--check` (see CLI.md).
+
 Decision precedence when a call succeeds:
 
 ```
@@ -1105,9 +1117,11 @@ type AnomalySessionStats, AnomalyVerdict, AnomalyCause
 // audit (gate 8)
 AuditLogger, GENESIS_HASH, stableStringify, verifyAuditEntry, generateAuditKeyPair,
 KmsAuditSigner, FileAuditSink, StreamAuditSink, MultiAuditSink, createDefaultAuditSink,
-OtlpAuditExporter, toOtlpLogRecord, DEFAULT_OTLP_LOGS_ENDPOINT
+OtlpAuditExporter, toOtlpLogRecord, DEFAULT_OTLP_LOGS_ENDPOINT,
+verifyAuditChain, createAuditAnchor, checkAuditAnchors      // external anchors (β3)
 type AuditAppendInput, AuditVerifyResult, AuditSink, AuditSinkOptions,
-OtlpExporterOptions, OtlpLogRecord, OtlpAttribute
+OtlpExporterOptions, OtlpLogRecord, OtlpAttribute,
+AuditAnchor, AnchorCheckResult, AnchorCreateResult, ChainVerifyResult
 
 // session state store (gate 1 — pluggable, shared across replicas)
 MemoryStateStore, RedisStateStore
@@ -1468,6 +1482,8 @@ vark check payloads/*.json --output-format streaming-json   # NDJSON for log shi
 vark scan "Ignore all rules…"      # per-stage detection pipeline
 vark bench                         # p99 budget table (exit 1 if over)
 vark audit verify audit.jsonl      # hash-chain VALID/CORRUPTED + first break
+vark audit anchor audit.jsonl      # external head checkpoint (β3)
+vark audit anchor audit.jsonl --check   # truncation/rewrite detection vs it (β3)
 vark audit tail audit.jsonl -f     # live color-coded stream
 vark audit export audit.jsonl --format html -o report.html
 vark policy test policy.vark.json  # shouldAllow/shouldBlock assertions
@@ -1482,6 +1498,7 @@ vark pii leaked.txt                # PII anonymization preview
 vark entropy page.html             # prompt-leak reflection report
 vark compress schema.json --name read_file
 vark session stats audit.jsonl     # per-session call/block table
+vark session replay audit.jsonl --session agent-1   # call-by-call timeline (β3)
 vark explain CIRCUIT_BREAKER       # why a gate fires + how to fix it
 vark doctor                        # readiness check
 ```

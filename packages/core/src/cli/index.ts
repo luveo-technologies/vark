@@ -8,7 +8,15 @@
 import { program } from 'commander';
 import { watch } from 'node:fs';
 import { runCheck, printCheckResults } from './commands/check.js';
-import { runAuditVerify, printVerifyResult, runTail, exportAudit, loadEntries } from './commands/audit.js';
+import {
+  runAuditVerify,
+  printVerifyResult,
+  runAuditAnchor,
+  printAuditAnchor,
+  runTail,
+  exportAudit,
+  loadEntries,
+} from './commands/audit.js';
 import type { ExportFormat } from './commands/audit.js';
 import {
   runPolicyTest,
@@ -36,6 +44,8 @@ import {
 } from './commands/analyze.js';
 import {
   runSessionStats,
+  runSessionReplay,
+  printSessionReplay,
   printGateExplanation,
   runDoctor,
   printDoctor,
@@ -250,6 +260,37 @@ auditCmd
       process.exit(1);
     }
   });
+
+auditCmd
+  .command('anchor [log]')
+  .description(
+    'Cut an external checkpoint of the audit trail head (default $VARK_AUDIT_PATH); --check verifies stored anchors',
+  )
+  .option('--check', 'Verify stored anchors against the log instead of creating one')
+  .option('-o, --out <file>', 'Anchor file (default: <log>.anchors.jsonl)')
+  .option('--webhook <url>', 'Also POST the anchor to a witness endpoint')
+  .option('--secret <secret>', 'HMAC-SHA256 secret for the webhook signature')
+  .action(
+    async (
+      log: string | undefined,
+      options: { check?: boolean; out?: string; webhook?: string; secret?: string },
+    ) => {
+      const started = Date.now();
+      try {
+        const outcome = await runAuditAnchor(resolveLogPath(log), {
+          check: options.check,
+          outPath: options.out,
+          webhook: options.webhook,
+          secret: options.secret,
+        });
+        printAuditAnchor(outcome, Date.now() - started);
+      } catch (error) {
+        // Unreadable log or unparseable anchor file — a data error, not drift.
+        console.error(`${red('Error:')} ${error instanceof Error ? error.message : String(error)}`);
+        process.exit(2);
+      }
+    },
+  );
 
 auditCmd
   .command('tail [log]')
@@ -549,6 +590,91 @@ sessionCmd
       process.exit(1);
     }
   });
+
+sessionCmd
+  .command('replay <log>')
+  .description('Replay an audit log call-by-call: timeline, decisions, redactions, per-session tallies')
+  .option('--session <id>', 'Only replay records for this session id')
+  .option('--from <seq>', 'Start at this seq (inclusive)')
+  .option('--to <seq>', 'End at this seq (inclusive)')
+  .option('--limit <n>', 'Replay at most n records')
+  .option('--output-format <format>', 'Output format: text (default) | streaming-json (NDJSON)', 'text')
+  .action(
+    async (
+      log: string,
+      options: { session?: string; from?: string; to?: string; limit?: string; outputFormat?: string },
+    ) => {
+      const parseSeq = (value: string | undefined, flag: string): number | undefined => {
+        if (value === undefined) return undefined;
+        const n = Number(value);
+        if (!Number.isInteger(n)) {
+          console.error(`${red('Error:')} ${flag} must be an integer (got "${value}")`);
+          process.exit(1);
+        }
+        return n;
+      };
+      let streaming: boolean;
+      try {
+        streaming = resolveOutputFormat(options.outputFormat) === 'streaming-json';
+      } catch (error) {
+        console.error(`${red('Error:')} ${error instanceof Error ? error.message : String(error)}`);
+        process.exitCode = 1;
+        return;
+      }
+      const from = parseSeq(options.from, '--from');
+      const to = parseSeq(options.to, '--to');
+      const limit = parseSeq(options.limit, '--limit');
+      const started = Date.now();
+      try {
+        const report = await runSessionReplay(log, { session: options.session, from, to, limit });
+        if (streaming) {
+          for (const session of report.sessions) {
+            for (const entry of session.entries) {
+              writeEvent({
+                type: 'result',
+                command: 'session-replay',
+                seq: entry.seq,
+                timestamp: entry.timestamp,
+                sessionId: entry.sessionId,
+                tool: entry.tool,
+                decision: entry.decision,
+                blockedBy: entry.blockedBy,
+                reason: entry.reason,
+                executionTimeMs: entry.executionTimeMs,
+                findings: entry.findings,
+                inputRedactions: entry.inputRedactions,
+                outputRedactions: entry.outputRedactions,
+                injectionSanitized: entry.injectionSanitized,
+                sanitizedInputs: entry.sanitizedInputs,
+              });
+            }
+          }
+          const ok = report.matched > 0;
+          writeEvent({
+            type: 'summary',
+            command: 'session-replay',
+            sessions: report.sessions.length,
+            matched: report.matched,
+            total: report.total,
+            ok,
+            elapsedMs: Date.now() - started,
+          });
+          if (!ok) process.exitCode = 1;
+        } else {
+          printSessionReplay(report, { logPath: log, elapsedMs: Date.now() - started });
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (streaming) {
+          writeEvent({ type: 'error', command: 'session-replay', message });
+          process.exitCode = 1;
+          return;
+        }
+        console.error(`${red('Error:')} ${message}`);
+        process.exit(1);
+      }
+    },
+  );
 
 program
   .command('explain <gate>')

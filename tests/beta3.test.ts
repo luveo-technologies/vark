@@ -3,6 +3,10 @@ import { mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { runCheck } from '../packages/core/src/cli/commands/check.js';
+import { runSessionReplay, printSessionReplay } from '../packages/core/src/cli/commands/ops.js';
+import { runAuditAnchor, printAuditAnchor, runAuditVerify } from '../packages/core/src/cli/commands/audit.js';
+import { createAuditAnchor, checkAuditAnchors, verifyAuditChain } from '../packages/core/src/audit-anchor.js';
+import { AuditLogger } from '../packages/core/src/audit-logger.js';
 import { runPolicyTest, signPolicyFile, verifyPolicyFile, diffPolicyFiles, generatePolicyKeyFiles } from '../packages/core/src/cli/commands/policy.js';
 import { policyKeyId } from '../packages/core/src/policy-signature.js';
 import { diffPolicy } from '../packages/core/src/policy-diff.js';
@@ -56,6 +60,7 @@ beforeEach(async () => {
 afterEach(async () => {
   await rm(FIXTURE_DIR, { recursive: true, force: true });
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
   vi.restoreAllMocks();
 });
 
@@ -1320,5 +1325,399 @@ describe('break-glass mode', () => {
     expect(runtime.breakGlass.active).toBe(false);
     expect((await runtime.execute('echo', { a: 1 }, { sessionId: 's2' })).blockedBy).toBe('SESSION_FROZEN');
     expect(runtime.audit.trail().some((e) => e.findings.includes('BREAK_GLASS_EXPIRED'))).toBe(true);
+  });
+});
+
+// ── beta.3 additions: vark session replay ──────────────────────────────────
+
+describe('vark session replay', () => {
+  function makeEntry(over: Partial<AuditEntry> & { seq: number }): AuditEntry {
+    return {
+      timestamp: '2026-01-01T00:00:00.000Z',
+      sessionId: 'alpha',
+      tool: 'read_file',
+      decision: 'ALLOWED',
+      sanitizedInputs: { path: './a.json' },
+      inputRedactions: 0,
+      outputRedactions: 0,
+      injectionSanitized: 0,
+      executionTimeMs: 5,
+      inspectionMs: 0.2,
+      tokensSaved: 10,
+      findings: [],
+      prevHash: 'p'.repeat(64),
+      hash: 'h'.repeat(64),
+      ...over,
+    };
+  }
+
+  const REPLAY_LOG: AuditEntry[] = [
+    makeEntry({ seq: 1, sessionId: 'alpha', tool: 'read_file' }),
+    makeEntry({
+      seq: 2,
+      sessionId: 'alpha',
+      tool: 'read_file',
+      decision: 'LOOP_BLOCKED',
+      blockedBy: 'LOOP_BLOCKED',
+      reason: 'call #4 repeats identical tool+arguments',
+      inputRedactions: 1,
+      timestamp: '2026-01-01T00:00:01.500Z',
+    }),
+    makeEntry({
+      seq: 3,
+      sessionId: 'beta',
+      tool: 'drop_table',
+      decision: 'HITL_DENIED',
+      blockedBy: 'HITL_DENIED',
+      reason: 'denied by ops@example.com',
+      findings: ['HITL_DENIED'],
+      timestamp: '2026-01-01T00:00:02.000Z',
+    }),
+    makeEntry({
+      seq: 4,
+      sessionId: 'alpha',
+      tool: 'fetch_page',
+      outputRedactions: 2,
+      findings: ['DLP_REDACTED'],
+      timestamp: '2026-01-01T00:00:03.250Z',
+    }),
+  ];
+
+  async function writeLog(name = 'replay.jsonl'): Promise<string> {
+    return writeFixture(name, REPLAY_LOG.map((e) => JSON.stringify(e)).join('\n'));
+  }
+
+  it('replays everything grouped by session with tallies', async () => {
+    const report = await runSessionReplay(await writeLog());
+    expect(report).toMatchObject({ matched: 4, total: 4 });
+    expect(report.sessions.map((s) => s.sessionId)).toEqual(['alpha', 'beta']); // first-appearance order
+
+    const alpha = report.sessions[0]!;
+    expect(alpha).toMatchObject({
+      allowed: 2,
+      refused: 1,
+      redactions: { input: 1, output: 2, injection: 0 },
+      executionMs: 15,
+      firstAt: REPLAY_LOG[0]!.timestamp,
+      lastAt: REPLAY_LOG[3]!.timestamp,
+    });
+    expect(alpha.byDecision).toEqual({ ALLOWED: 2, LOOP_BLOCKED: 1 });
+
+    const beta = report.sessions[1]!;
+    expect(beta).toMatchObject({ allowed: 0, refused: 1 });
+    expect(beta.byDecision).toEqual({ HITL_DENIED: 1 });
+  });
+
+  it('filters by session, seq range and limit', async () => {
+    const path = await writeLog();
+
+    const bySession = await runSessionReplay(path, { session: 'alpha' });
+    expect(bySession.matched).toBe(3);
+    expect(bySession.total).toBe(4);
+    expect(bySession.sessions.map((s) => s.sessionId)).toEqual(['alpha']);
+
+    const ranged = await runSessionReplay(path, { from: 2, to: 3 });
+    expect(ranged.sessions.map((s) => s.sessionId)).toEqual(['alpha', 'beta']);
+    expect(ranged.matched).toBe(2);
+
+    const limited = await runSessionReplay(path, { limit: 2 });
+    expect(limited.matched).toBe(2);
+    expect(limited.sessions[0]!.entries.map((e) => e.seq)).toEqual([1, 2]);
+
+    const none = await runSessionReplay(path, { session: 'ghost' });
+    expect(none).toMatchObject({ matched: 0, total: 4, sessions: [] });
+  });
+
+  it('printer renders a timeline with offsets, reasons and findings', async () => {
+    const path = await writeLog();
+    const report = await runSessionReplay(path, { session: 'alpha' });
+    const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    printSessionReplay(report, { logPath: path });
+    const text = spy.mock.calls.map((call) => String(call[0])).join('\n');
+
+    expect(text).toContain('session alpha');
+    expect(text).toContain('2 allowed'); // colored separately from the slash
+    expect(text).toContain('1 refused');
+    expect(text).toContain('#2');
+    expect(text).toContain('LOOP_BLOCKED');
+    expect(text).toContain('call #4 repeats identical tool+arguments');
+    expect(text).toContain('[in:1]');
+    expect(text).toContain('[DLP_REDACTED]'); // allowed-path finding survives
+    expect(text).toContain('+1.5s'); // offset from the session's first record
+    expect(text).toContain('REPLAYED 3 records');
+    spy.mockRestore();
+  });
+
+  it('exits 1 when filters match nothing (exitCode restored)', async () => {
+    const path = await writeLog();
+    const previous = process.exitCode;
+    try {
+      process.exitCode = undefined;
+      const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const empty = await runSessionReplay(path, { session: 'ghost' });
+      printSessionReplay(empty, { logPath: path });
+      expect(process.exitCode).toBe(1);
+      const text = spy.mock.calls.map((call) => String(call[0])).join('\n');
+      expect(text).toContain('NOTHING REPLAYED');
+      expect(text).toContain('4 in log');
+      spy.mockRestore();
+    } finally {
+      process.exitCode = previous;
+    }
+  });
+});
+
+// ── beta.3 additions: vark audit anchor ─────────────────────────────────────
+
+describe('vark audit anchor', () => {
+  function makeChain(count: number): AuditEntry[] {
+    const logger = new AuditLogger({ maxEntries: 50 });
+    for (let i = 0; i < count; i += 1) {
+      logger.append({
+        sessionId: 'anchor-test',
+        tool: 'read_file',
+        decision: 'ALLOWED',
+        sanitizedInputs: { i },
+        executionTimeMs: 2,
+        inputRedactions: 0,
+        outputRedactions: 0,
+        injectionSanitized: 0,
+      });
+    }
+    return logger.trail();
+  }
+
+  async function writeChain(entries: AuditEntry[], name = 'anchor.jsonl'): Promise<string> {
+    return writeFixture(name, entries.map((e) => JSON.stringify(e)).join('\n'));
+  }
+
+  it('pins the trail head and holds against the intact log', () => {
+    const entries = makeChain(3);
+    const created = createAuditAnchor(entries);
+    expect(created.ok).toBe(true);
+    if (!created.ok) throw new Error('expected an anchor');
+    expect(created.anchor).toMatchObject({
+      seq: 3,
+      totalEntries: 3,
+      hash: entries[2]!.hash,
+    });
+    expect(Number.isNaN(Date.parse(created.anchor.anchoredAt))).toBe(false);
+    expect(checkAuditAnchors(entries, [created.anchor])).toMatchObject({ ok: true, checked: 1 });
+  });
+
+  it('refuses empty and broken trails — a bad chain is never attested', () => {
+    expect(createAuditAnchor([])).toMatchObject({ ok: false, reason: 'empty' });
+
+    const entries = makeChain(3);
+    const tampered = [...entries];
+    tampered[1] = { ...tampered[1]!, reason: 'rewritten by hand' };
+    const created = createAuditAnchor(tampered);
+    expect(created.ok).toBe(false);
+    if (created.ok) throw new Error('expected a refusal');
+    expect(created.reason).toBe('broken-chain');
+    expect(created.detail).toContain('broken at seq 2');
+    expect(created.detail).toContain('VARK_AUDIT_HMAC_KEY');
+  });
+
+  it('detects truncation, in-place edits and rewritten records', () => {
+    const entries = makeChain(4);
+    const created = createAuditAnchor(entries);
+    if (!created.ok) throw new Error('expected an anchor');
+    const anchor = created.anchor;
+
+    // Head rolled off — the pin proves records the chain alone cannot see are gone
+    expect(checkAuditAnchors(entries.slice(0, 3), [anchor])).toMatchObject({
+      ok: false,
+      reason: 'truncated',
+    });
+
+    // Content edited in place, stored hashes untouched → recomputation catches it
+    const edited = [...entries];
+    edited[3] = { ...edited[3]!, reason: 'post-hoc edit' };
+    expect(checkAuditAnchors(edited, [anchor])).toMatchObject({
+      ok: false,
+      reason: 'broken-chain',
+    });
+
+    // Record replaced wholesale (hash re-cut) → the external pin catches it
+    const replaced = [...entries];
+    replaced[3] = { ...replaced[3]!, hash: 'f'.repeat(64) };
+    expect(checkAuditAnchors(replaced, [anchor])).toMatchObject({
+      ok: false,
+      reason: 'hash-mismatch',
+    });
+
+    expect(checkAuditAnchors(entries, [])).toMatchObject({ ok: false, reason: 'no-anchors' });
+
+    // Front-trimming (ring buffer) keeps the chain internally valid — by design
+    expect(verifyAuditChain(entries.slice(1))).toMatchObject({ ok: true, checked: 3 });
+  });
+
+  it('HMAC-signed trails validate only with the key', () => {
+    const logger = new AuditLogger({ hmacKey: 'anchor-secret' });
+    for (let i = 0; i < 2; i += 1) {
+      logger.append({
+        sessionId: 'anchor-test',
+        tool: 'read_file',
+        decision: 'ALLOWED',
+        sanitizedInputs: { i },
+        executionTimeMs: 2,
+        inputRedactions: 0,
+        outputRedactions: 0,
+        injectionSanitized: 0,
+      });
+    }
+    const entries = logger.trail();
+    expect(verifyAuditChain(entries).ok).toBe(false); // plain SHA-256 cannot recompute HMAC links
+    expect(verifyAuditChain(entries, 'anchor-secret')).toMatchObject({ ok: true, checked: 2 });
+    expect(createAuditAnchor(entries).ok).toBe(false);
+    expect(createAuditAnchor(entries, { key: 'anchor-secret' }).ok).toBe(true);
+  });
+
+  it('runAuditAnchor writes an idempotent sidecar and verifies it', async () => {
+    const entries = makeChain(3);
+    const log = await writeChain(entries);
+
+    const first = await runAuditAnchor(log);
+    expect(first.kind).toBe('created');
+
+    const again = await runAuditAnchor(log); // identical head → nothing new to anchor
+    expect(again.kind).toBe('already');
+
+    const checked = await runAuditAnchor(log, { check: true });
+    expect(checked.kind).toBe('checked');
+    if (checked.kind !== 'checked') throw new Error('expected a check');
+    expect(checked.check).toMatchObject({ ok: true, checked: 1 });
+
+    // Roll the head off the log → the pin proves the records vanished
+    await writeChain(entries.slice(0, 2));
+    const drifted = await runAuditAnchor(log, { check: true });
+    if (drifted.kind !== 'checked') throw new Error('expected a check');
+    expect(drifted.check).toMatchObject({ ok: false, reason: 'truncated' });
+  });
+
+  it('check without an anchor file rejects (CLI exits 2)', async () => {
+    const log = await writeChain(makeChain(2), 'anchor-none.jsonl');
+    await expect(runAuditAnchor(log, { check: true })).rejects.toThrow(/ENOENT|no such file/i);
+  });
+
+  it('a broken trail is refused as an outcome (CLI exits 1), never attested', async () => {
+    const entries = makeChain(3);
+    const broken = [...entries];
+    broken[1] = { ...broken[1]!, reason: 'edited after the fact' };
+    const log = await writeChain(broken, 'anchor-broken.jsonl');
+
+    const outcome = await runAuditAnchor(log);
+    expect(outcome.kind).toBe('refused');
+    if (outcome.kind !== 'refused') throw new Error('expected a refusal');
+    expect(outcome.detail).toContain('broken at seq 2');
+    await expect(readFile(`${log}.anchors.jsonl`, 'utf8')).rejects.toThrow(); // nothing written
+  });
+
+  it('posts a signed anchor to the witness; delivery failure surfaces but the local anchor persists', async () => {
+    const posts: Array<{ url: unknown; init: RequestInit }> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: unknown, init: RequestInit) => {
+        posts.push({ url, init });
+        return new Response('{}', { status: 200 });
+      }),
+    );
+
+    const log = await writeChain(makeChain(2), 'anchor-wh.jsonl');
+    const outcome = await runAuditAnchor(log, {
+      webhook: 'https://witness.example/anchor',
+      secret: 's3',
+    });
+    expect(outcome.kind).toBe('created');
+    if (outcome.kind !== 'created') throw new Error('expected created');
+    expect(outcome.webhookPosted).toBe(true);
+    expect(outcome.webhookError).toBeUndefined();
+
+    expect(posts).toHaveLength(1);
+    expect(posts[0]!.url).toBe('https://witness.example/anchor');
+    const body = String(posts[0]!.init.body);
+    const payload = JSON.parse(body) as { event: string; anchor: { seq: number } };
+    expect(payload.event).toBe('audit.anchor');
+    expect(payload.anchor.seq).toBe(2);
+    const headers = posts[0]!.init.headers as Record<string, string>;
+    expect(verifyWebhookSignature('s3', body, headers['x-vark-signature']!)).toBe(true);
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        throw new Error('ECONNREFUSED');
+      }),
+    );
+    const log2 = await writeChain(makeChain(1), 'anchor-wh2.jsonl');
+    const failed = await runAuditAnchor(log2, { webhook: 'https://witness.example/anchor' });
+    expect(failed.kind).toBe('created');
+    if (failed.kind !== 'created') throw new Error('expected created');
+    expect(failed.webhookPosted).toBe(false);
+    expect(failed.webhookError).toContain('ECONNREFUSED');
+    const anchors = await readFile(`${log2}.anchors.jsonl`, 'utf8');
+    expect(anchors).toContain('"seq":1'); // local checkpoint still landed
+  });
+
+  it('printAuditAnchor sets exit 1 on refusal and drift, stays 0 on success', async () => {
+    const previous = process.exitCode;
+    try {
+      process.exitCode = undefined;
+      const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const entries = makeChain(3);
+      const log = await writeChain(entries, 'anchor-print.jsonl');
+
+      const created = await runAuditAnchor(log);
+      printAuditAnchor(created, 5);
+      expect(process.exitCode).toBeUndefined();
+      const createdText = spy.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(createdText).toContain('ANCHORED seq 3');
+
+      const checked = await runAuditAnchor(log, { check: true });
+      printAuditAnchor(checked, 2);
+      expect(process.exitCode).toBeUndefined();
+
+      await writeChain(entries.slice(0, 1), 'anchor-print.jsonl');
+      process.exitCode = undefined;
+      const drifted = await runAuditAnchor(log, { check: true });
+      printAuditAnchor(drifted, 2);
+      expect(process.exitCode).toBe(1);
+
+      process.exitCode = undefined;
+      const broken = [...entries];
+      broken[0] = { ...broken[0]!, reason: 'edit' };
+      const refused = await runAuditAnchor(await writeChain(broken, 'anchor-print2.jsonl'));
+      printAuditAnchor(refused, 1);
+      expect(process.exitCode).toBe(1);
+
+      spy.mockRestore();
+    } finally {
+      process.exitCode = previous;
+    }
+  });
+
+  it('vark audit verify validates HMAC-signed trails when the key is set', async () => {
+    const logger = new AuditLogger({ hmacKey: 'verify-key' });
+    for (let i = 0; i < 2; i += 1) {
+      logger.append({
+        sessionId: 'hmac-test',
+        tool: 'read_file',
+        decision: 'ALLOWED',
+        sanitizedInputs: { i },
+        executionTimeMs: 2,
+        inputRedactions: 0,
+        outputRedactions: 0,
+        injectionSanitized: 0,
+      });
+    }
+    const log = await writeChain(logger.trail(), 'hmac-verify.jsonl');
+
+    vi.stubEnv('VARK_AUDIT_HMAC_KEY', 'verify-key');
+    const withKey = await runAuditVerify(log);
+    expect(withKey).toMatchObject({ valid: true, checked: 2 });
+
+    vi.stubEnv('VARK_AUDIT_HMAC_KEY', '');
+    const withoutKey = await runAuditVerify(log);
+    expect(withoutKey.valid).toBe(false); // fails closed without the key
   });
 });

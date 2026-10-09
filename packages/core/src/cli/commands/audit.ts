@@ -5,11 +5,14 @@
  * color-coded by decision; export renders JSON, CSV, or a styled HTML report.
  */
 
-import { readFile, watch } from 'node:fs/promises';
+import { appendFile, readFile, watch } from 'node:fs/promises';
 import { extname, resolve } from 'node:path';
 import type { AuditEntry } from '../../types.js';
-import { GENESIS_HASH, stableStringify } from '../../audit-logger.js';
-import { createHash } from 'node:crypto';
+import { stableStringify } from '../../audit-logger.js';
+import { createHash, createHmac } from 'node:crypto';
+import { checkAuditAnchors, createAuditAnchor } from '../../audit-anchor.js';
+import type { AnchorCheckResult, AuditAnchor } from '../../audit-anchor.js';
+import { signWebhookBody } from '../../gates/hitl-gate.js';
 import pkg from 'picocolors';
 const { green, red, yellow, bold, dim } = pkg;
 import { printBanner, printSummaryLine, chainDots, decisionChip } from '../ux.js';
@@ -39,8 +42,9 @@ export async function runAuditVerify(
     };
   }
 
-  const result = verifyChain(entries);
-  return result;
+  // HMAC-signed trails (audit.hmacKey) only recompute with the key.
+  const key = process.env.VARK_AUDIT_HMAC_KEY || undefined;
+  return verifyChain(entries, key);
 }
 
 async function loadAuditLog(filePath: string): Promise<AuditLogEntry[]> {
@@ -71,13 +75,21 @@ async function loadAuditLog(filePath: string): Promise<AuditLogEntry[]> {
   return entries;
 }
 
-function verifyChain(entries: AuditLogEntry[]): VerifyResult {
+/**
+ * Recompute the chain. Starts at `entries[0]` — the same contract as
+ * `AuditLogger.verify()` — so a ring-buffer-trimmed log stays valid; lost
+ * records are what `audit anchor --check` detects (an anchor pins a `seq`
+ * the chain alone can never prove still exists). HMAC-signed links
+ * recompute only when `key` is provided (`$VARK_AUDIT_HMAC_KEY`).
+ */
+function verifyChain(entries: AuditLogEntry[], key?: string | Uint8Array): VerifyResult {
   if (entries.length === 0) {
     return { valid: true, totalRecords: 0, checked: 0 };
   }
 
-  let prevHash = GENESIS_HASH;
-  let expectedSeq = 1;
+  const first = entries[0]!;
+  let prevHash = first.prevHash;
+  let expectedSeq = first.seq;
 
   for (let i = 0; i < entries.length; i += 1) {
     const entry = entries[i]!;
@@ -106,7 +118,7 @@ function verifyChain(entries: AuditLogEntry[]): VerifyResult {
 
     // Recompute hash
     const { hash, prevHash: _, ...entryBody } = entry;
-    const computedHash = computeEntryHash(entryBody, prevHash);
+    const computedHash = computeEntryHash(entryBody, prevHash, key);
 
     if (computedHash !== entry.hash) {
       return {
@@ -130,9 +142,14 @@ function verifyChain(entries: AuditLogEntry[]): VerifyResult {
   };
 }
 
-function computeEntryHash(body: Record<string, unknown>, prevHash: string): string {
+function computeEntryHash(
+  body: Record<string, unknown>,
+  prevHash: string,
+  key?: string | Uint8Array,
+): string {
   const bodyWithPrev = { ...body, prevHash };
   const canonical = stableStringify(bodyWithPrev);
+  if (key) return createHmac('sha256', key).update(canonical).digest('hex');
   return createHash('sha256').update(canonical).digest('hex');
 }
 
@@ -158,12 +175,178 @@ export function printVerifyResult(result: VerifyResult, elapsedMs?: number): voi
       console.log(`    decision:  ${result.firstBrokenRecord.decision}`);
     }
 
+    if (!process.env.VARK_AUDIT_HMAC_KEY) {
+      console.log(
+        `\n  ${dim('HMAC-signed trail? Set VARK_AUDIT_HMAC_KEY — it only verifies with the key.')}`,
+      );
+    }
+
     printSummaryLine(
       [red(`✘ CORRUPTED at seq ${result.brokenAt}`), dim(`${result.checked} verified before the break`)],
       elapsedMs,
     );
 
     process.exitCode = 1;
+  }
+}
+
+// ── anchor ──────────────────────────────────────────────────────────────────
+
+export type AnchorOutcome =
+  | {
+      kind: 'created';
+      anchor: AuditAnchor;
+      anchorsPath: string;
+      total: number;
+      webhookPosted: boolean;
+      webhookError?: string;
+    }
+  | { kind: 'already'; anchor: AuditAnchor; anchorsPath: string }
+  | { kind: 'refused'; reason: string; detail: string; anchorsPath: string }
+  | { kind: 'checked'; check: AnchorCheckResult; anchorsPath: string; totalAnchors: number };
+
+async function readAnchorsFile(path: string, required: boolean): Promise<AuditAnchor[]> {
+  let raw: string;
+  try {
+    raw = await readFile(path, 'utf8');
+  } catch (error) {
+    if (!required && (error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  }
+  return raw
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .map((line) => JSON.parse(line) as AuditAnchor);
+}
+
+/**
+ * `vark audit anchor` — cut (or check) an external checkpoint of the trail
+ * head. Sidecar defaults to `<log>.anchors.jsonl`; `--webhook` additionally
+ * POSTs the anchor as an HMAC-signed witness. Exit contract (via the
+ * printer): 0 = anchored/intact/already-anchored, 1 = refused or drifted,
+ * 2 = unreadable log or anchor file (thrown).
+ */
+export async function runAuditAnchor(
+  logPath: string,
+  opts: { check?: boolean; outPath?: string; webhook?: string; secret?: string } = {},
+): Promise<AnchorOutcome> {
+  const resolvedPath = resolve(logPath);
+  const anchorsPath = opts.outPath ? resolve(opts.outPath) : `${resolvedPath}.anchors.jsonl`;
+  const key = process.env.VARK_AUDIT_HMAC_KEY || undefined;
+  const entries = await loadEntries(resolvedPath);
+
+  if (opts.check) {
+    const anchors = await readAnchorsFile(anchorsPath, true); // missing file → throws → exit 2
+    const check = checkAuditAnchors(entries, anchors, key ? { key } : {});
+    return { kind: 'checked', check, anchorsPath, totalAnchors: anchors.length };
+  }
+
+  const created = createAuditAnchor(entries, key ? { key } : {});
+  if (!created.ok) {
+    return { kind: 'refused', reason: created.reason, detail: created.detail, anchorsPath };
+  }
+
+  // Idempotent: the identical head is already anchored (append-only file).
+  const existing = await readAnchorsFile(anchorsPath, false);
+  const duplicate = existing.some(
+    (a) => a.seq === created.anchor.seq && a.hash === created.anchor.hash,
+  );
+  if (duplicate) return { kind: 'already', anchor: created.anchor, anchorsPath };
+
+  await appendFile(anchorsPath, `${JSON.stringify(created.anchor)}\n`, 'utf8');
+
+  let webhookPosted = false;
+  let webhookError: string | undefined;
+  if (opts.webhook) {
+    const body = JSON.stringify({
+      event: 'audit.anchor',
+      issuedAt: new Date().toISOString(),
+      anchor: created.anchor,
+      log: resolvedPath,
+    });
+    try {
+      const headers: Record<string, string> = {
+        'content-type': 'application/json',
+        'user-agent': 'vark-audit',
+      };
+      if (opts.secret) headers['x-vark-signature'] = signWebhookBody(opts.secret, body);
+      const response = await fetch(opts.webhook, {
+        method: 'POST',
+        headers,
+        body,
+        signal: AbortSignal.timeout(5_000),
+      });
+      if (!response.ok) throw new Error(`witness responded ${response.status}`);
+      webhookPosted = true;
+    } catch (error) {
+      webhookError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  return {
+    kind: 'created',
+    anchor: created.anchor,
+    anchorsPath,
+    total: entries.length,
+    webhookPosted,
+    webhookError,
+  };
+}
+
+export function printAuditAnchor(outcome: AnchorOutcome, elapsedMs?: number): void {
+  const checking = outcome.kind === 'checked';
+  printBanner(checking ? 'audit anchor  ·  checkpoint verification' : 'audit anchor  ·  external checkpoint');
+  console.log(`  file:  ${dim('anchorsPath' in outcome ? outcome.anchorsPath : '')}`);
+
+  switch (outcome.kind) {
+    case 'created': {
+      console.log(`  head:  seq ${outcome.anchor.seq} · ${dim(`${outcome.anchor.hash.slice(0, 16)}…`)}`);
+      if (outcome.webhookError) {
+        console.log(`  ${red(`✘ witness delivery failed: ${outcome.webhookError}`)}`);
+        printSummaryLine(
+          [red(`✘ anchor written locally but witness failed (seq ${outcome.anchor.seq})`), dim('retry once the endpoint recovers')],
+          elapsedMs,
+        );
+        process.exitCode = 1;
+        return;
+      }
+      if (outcome.webhookPosted) console.log(`  ${dim('witness: POSTed ✓')}`);
+      printSummaryLine(
+        [green(`✔ ANCHORED seq ${outcome.anchor.seq}`), dim(`${outcome.total} records in log`)],
+        elapsedMs,
+      );
+      return;
+    }
+    case 'already': {
+      console.log(`  head:  seq ${outcome.anchor.seq} · ${dim(`${outcome.anchor.hash.slice(0, 16)}…`)}`);
+      printSummaryLine(
+        [green('✔ already anchored'), dim(`seq ${outcome.anchor.seq} — nothing new to anchor`)],
+        elapsedMs,
+      );
+      return;
+    }
+    case 'refused': {
+      console.log(`  ${red(`✘ ${outcome.reason}`)}: ${outcome.detail}`);
+      printSummaryLine([red('✘ REFUSED'), dim(outcome.detail)], elapsedMs);
+      process.exitCode = 1;
+      return;
+    }
+    case 'checked': {
+      const { check } = outcome;
+      console.log(`  ${dim(`${outcome.totalAnchors} anchor(s) on file`)}`);
+      if (check.ok) {
+        printSummaryLine(
+          [green(`✔ INTACT — ${check.checked} anchor(s) hold`), dim('no truncation, no rewrite, chain recomputes')],
+          elapsedMs,
+        );
+        return;
+      }
+      console.log(`  ${red(`✘ ${check.reason ?? 'failed'}`)}: ${check.detail ?? ''}`);
+      printSummaryLine([red(`✘ DRIFTED (${check.reason ?? 'failed'})`), dim(check.detail ?? '')], elapsedMs);
+      process.exitCode = 1;
+      return;
+    }
   }
 }
 

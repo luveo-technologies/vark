@@ -2,6 +2,7 @@
  * `vark session|explain|doctor` + `vark policy lint|init` — operator tooling.
  *
  * - `session stats`: per-session call/block tables derived from an audit log.
+ * - `session replay`: call-by-call timeline of a session (or whole log).
  * - `explain`: gate explainer with why-it-fires and remediation hints.
  * - `doctor`: environment + install readiness check.
  * - `policy lint` / `policy init`: validate or scaffold a policy file.
@@ -11,7 +12,7 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import type { AuditEntry } from '../../types.js';
 import { loadEntries } from './audit.js';
-import { printBanner, printSummaryLine, table } from '../ux.js';
+import { printBanner, printSummaryLine, table, decisionChip } from '../ux.js';
 import pkg from 'picocolors';
 const { green, red, yellow, dim, bold, cyan } = pkg;
 
@@ -38,6 +39,168 @@ export function sessionStats(entries: AuditEntry[]): SessionRow[] {
 
 export async function runSessionStats(logPath: string): Promise<SessionRow[]> {
   return sessionStats(await loadEntries(logPath));
+}
+
+// ── session replay ─────────────────────────────────────────────────────────
+
+export interface ReplayOptions {
+  /** Only replay records for this session id. */
+  session?: string;
+  /** First seq to include (inclusive). */
+  from?: number;
+  /** Last seq to include (inclusive). */
+  to?: number;
+  /** Replay at most this many records (after the other filters). */
+  limit?: number;
+}
+
+export interface ReplaySession {
+  sessionId: string;
+  entries: AuditEntry[];
+  allowed: number;
+  refused: number;
+  byDecision: Record<string, number>;
+  redactions: { input: number; output: number; injection: number };
+  executionMs: number;
+  firstAt: string;
+  lastAt: string;
+}
+
+export interface ReplayReport {
+  /** Sessions in first-appearance order, each chronologically ordered. */
+  sessions: ReplaySession[];
+  /** Records after filtering — what gets replayed. */
+  matched: number;
+  /** Records in the log before filtering. */
+  total: number;
+}
+
+/**
+ * Reconstruct a call-by-call timeline from an audit log. Grouping is by
+ * session (first-appearance order); `matched`/`total` let callers report
+ * "replayed X of Y" when filters trimmed the view.
+ */
+export async function runSessionReplay(logPath: string, opts: ReplayOptions = {}): Promise<ReplayReport> {
+  const all = await loadEntries(logPath);
+  let entries = all;
+  if (opts.session !== undefined) entries = entries.filter((e) => e.sessionId === opts.session);
+  if (opts.from !== undefined) entries = entries.filter((e) => e.seq >= opts.from!);
+  if (opts.to !== undefined) entries = entries.filter((e) => e.seq <= opts.to!);
+  if (opts.limit !== undefined) entries = entries.slice(0, Math.max(0, opts.limit));
+
+  const sessions: ReplaySession[] = [];
+  const byId = new Map<string, ReplaySession>();
+  for (const entry of entries) {
+    let session = byId.get(entry.sessionId);
+    if (!session) {
+      session = {
+        sessionId: entry.sessionId,
+        entries: [],
+        allowed: 0,
+        refused: 0,
+        byDecision: {},
+        redactions: { input: 0, output: 0, injection: 0 },
+        executionMs: 0,
+        firstAt: entry.timestamp,
+        lastAt: entry.timestamp,
+      };
+      byId.set(entry.sessionId, session);
+      sessions.push(session);
+    }
+    session.entries.push(entry);
+    if (entry.decision === 'ALLOWED') session.allowed += 1;
+    else session.refused += 1;
+    session.byDecision[entry.decision] = (session.byDecision[entry.decision] ?? 0) + 1;
+    session.redactions.input += entry.inputRedactions;
+    session.redactions.output += entry.outputRedactions;
+    session.redactions.injection += entry.injectionSanitized;
+    session.executionMs += entry.executionTimeMs;
+    session.lastAt = entry.timestamp;
+  }
+  return { sessions, matched: entries.length, total: all.length };
+}
+
+function formatOffset(ms: number): string {
+  return ms < 1_000 ? `+${ms}ms` : `+${(ms / 1_000).toFixed(1)}s`;
+}
+
+function formatReplayLine(entry: AuditEntry, offsetMs: number): string {
+  const time = entry.timestamp.slice(11, 23);
+  const redactions: string[] = [];
+  if (entry.inputRedactions > 0) redactions.push(`in:${entry.inputRedactions}`);
+  if (entry.outputRedactions > 0) redactions.push(`out:${entry.outputRedactions}`);
+  if (entry.injectionSanitized > 0) redactions.push(`inj:${entry.injectionSanitized}`);
+
+  const parts = [
+    dim(time),
+    dim(formatOffset(offsetMs)),
+    dim(`#${entry.seq}`),
+    decisionChip(entry.decision),
+    bold(entry.tool),
+    dim(`${Math.round(entry.executionTimeMs)}ms`),
+  ];
+  if (redactions.length > 0) parts.push(yellow(`[${redactions.join(' ')}]`));
+  // Refusals already show their gate via the chip; findings matter on the
+  // allowed path (DLP redactions, BREAK_GLASS overrides, injection flags).
+  if (entry.decision === 'ALLOWED' && entry.findings.length > 0) {
+    parts.push(yellow(`[${entry.findings.join(' ')}]`));
+  }
+  const input = JSON.stringify(entry.sanitizedInputs);
+  if (input !== undefined) parts.push(dim(input.length > 72 ? `${input.slice(0, 72)}…` : input));
+  if (entry.reason) {
+    parts.push(entry.blockedBy ? red(`— ${entry.reason.slice(0, 90)}`) : dim(`— ${entry.reason.slice(0, 90)}`));
+  }
+  return parts.join('  ');
+}
+
+export function printSessionReplay(
+  report: ReplayReport,
+  opts: { logPath: string; elapsedMs?: number },
+): void {
+  printBanner(`session replay  ·  ${opts.logPath}`);
+
+  if (report.matched === 0) {
+    console.log(
+      `  ${yellow('⚠')} no records to replay${report.total === 0 ? ' (empty log)' : ` (${report.total} in log, none matched the filters)`}`,
+    );
+    printSummaryLine([yellow('✘ NOTHING REPLAYED'), dim('check --session / --from / --to filters')], opts.elapsedMs);
+    process.exitCode = 1;
+    return;
+  }
+
+  for (const session of report.sessions) {
+    const start = Date.parse(session.firstAt);
+    console.log('');
+    console.log(
+      `  ${bold(`session ${session.sessionId}`)}  ·  ${session.entries.length} call${session.entries.length === 1 ? '' : 's'}  ·  ` +
+        `${green(`${session.allowed} allowed`)} / ${red(`${session.refused} refused`)}  ·  ` +
+        `${session.firstAt.slice(11, 19)} → ${session.lastAt.slice(11, 19)}  ·  ${Math.round(session.executionMs)}ms total`,
+    );
+    for (const entry of session.entries) {
+      console.log(`    ${formatReplayLine(entry, Date.parse(entry.timestamp) - start)}`);
+    }
+    const redactions = session.redactions.input + session.redactions.output + session.redactions.injection;
+    const breakdown = Object.entries(session.byDecision)
+      .map(([decision, count]) => `${decision}×${count}`)
+      .join('  ');
+    const redactionNote =
+      redactions > 0
+        ? `  ·  redactions: in ${session.redactions.input} / out ${session.redactions.output} / inj ${session.redactions.injection}`
+        : '';
+    if (Object.keys(session.byDecision).length > 1 || redactions > 0) {
+      console.log(`    ${dim(`${breakdown}${redactionNote}`)}`);
+    }
+  }
+
+  const filtersNote = report.matched < report.total ? dim(`of ${report.total} in log`) : '';
+  printSummaryLine(
+    [
+      green(`✔ REPLAYED ${report.matched} record${report.matched === 1 ? '' : 's'}`),
+      dim(`${report.sessions.length} session${report.sessions.length === 1 ? '' : 's'}`),
+      ...(filtersNote ? [filtersNote] : []),
+    ],
+    opts.elapsedMs,
+  );
 }
 
 // ── explain ─────────────────────────────────────────────────────────────────

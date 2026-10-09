@@ -129,6 +129,13 @@ export type { AnomalySessionStats, AnomalyVerdict, AnomalyCause } from './anomal
 
 export { AuditLogger, GENESIS_HASH, stableStringify } from './audit-logger.js';
 export type { AuditAppendInput, AuditVerifyResult } from './audit-logger.js';
+export { verifyAuditChain, createAuditAnchor, checkAuditAnchors } from './audit-anchor.js';
+export type {
+  AuditAnchor,
+  AnchorCheckResult,
+  AnchorCreateResult,
+  ChainVerifyResult,
+} from './audit-anchor.js';
 
 export {
   DEFAULT_MAX_EXECUTION_MS,
