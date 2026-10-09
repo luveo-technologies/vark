@@ -84,10 +84,33 @@ export function benchmarkGate(
     fn();
     samples[i] = performance.now() - start;
   }
+  return summarize(gate, samples);
+}
+
+/**
+ * Async variant for gates that now go through awaitable plumbing (the
+ * anomaly guard reads/writes the pluggable state store).
+ */
+export async function benchmarkGateAsync(
+  gate: string,
+  fn: () => Promise<unknown>,
+  iterations: number,
+): Promise<GateBenchRow> {
+  for (let i = 0; i < 50; i += 1) await fn();
+  const samples = new Array<number>(iterations);
+  for (let i = 0; i < iterations; i += 1) {
+    const start = performance.now();
+    await fn();
+    samples[i] = performance.now() - start;
+  }
+  return summarize(gate, samples);
+}
+
+function summarize(gate: string, samples: number[]): GateBenchRow {
   const sorted = [...samples].sort((a, b) => a - b);
   return {
     gate,
-    avgMs: samples.reduce((sum, s) => sum + s, 0) / iterations,
+    avgMs: samples.reduce((sum, s) => sum + s, 0) / samples.length,
     p50Ms: percentile(sorted, 0.5),
     p99Ms: percentile(sorted, 0.99),
     maxMs: sorted[sorted.length - 1] ?? 0,
@@ -95,14 +118,14 @@ export function benchmarkGate(
 }
 
 /** Benchmark every pipeline gate on representative payloads. */
-export function runPerGateBench(iterations = 2000): GateBenchRow[] {
+export async function runPerGateBench(iterations = 2000): Promise<GateBenchRow[]> {
   const guard = new AnomalyGuard({ maxCallsPerMinute: 1_000_000, maxTotalCalls: 1_000_000_000 });
   const audit = new AuditLogger({ maxEntries: iterations + 10 });
   let seq = 0;
 
   return [
-    benchmarkGate('anomaly', () => {
-      guard.check(`bench-${seq++ % 997}`, 'tool', BENIGN_ARGS);
+    await benchmarkGateAsync('anomaly', async () => {
+      await guard.check(`bench-${seq++ % 997}`, 'tool', BENIGN_ARGS);
     }, iterations),
     benchmarkGate('capability', () => {
       inspectArguments(BENIGN_ARGS, GRANT_CAPS);
@@ -132,7 +155,7 @@ export function runPerGateBench(iterations = 2000): GateBenchRow[] {
   ];
 }
 
-export function runBench(options: BenchOptions = {}): BenchReport {
+export async function runBench(options: BenchOptions = {}): Promise<BenchReport> {
   const iterations = options.iterations ?? 20_000;
   const bench = benchmarkInspection(ATTACK_PAYLOAD, undefined, iterations);
   return {
@@ -142,7 +165,7 @@ export function runBench(options: BenchOptions = {}): BenchReport {
     p99Ms: bench.p99Ms,
     maxMs: bench.maxMs,
     withinBudget: bench.p99Ms < 1,
-    gates: runPerGateBench(options.gateIterations ?? 2000),
+    gates: await runPerGateBench(options.gateIterations ?? 2000),
   };
 }
 

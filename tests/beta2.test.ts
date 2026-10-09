@@ -315,7 +315,7 @@ describe('beta.2 P1 — descriptor pin enforced across re-listings', () => {
     expect(result.success).toBe(false);
     expect(result.blockedBy).toBe('DESCRIPTOR_PIN_VIOLATION');
 
-    const guard = wrapped!.check({ url: 'https://example.com' });
+    const guard = await wrapped!.check({ url: 'https://example.com' });
     expect(guard.safe).toBe(false);
     expect(guard.blockedBy).toBe('DESCRIPTOR_PIN_VIOLATION');
   });

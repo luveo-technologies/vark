@@ -75,7 +75,7 @@ export interface WrappedMCPTool {
   /** CTP signature plus token accounting. */
   compression: CompressionReport;
   /** Dry run: guards only, no server call. */
-  check: (args?: unknown, options?: ExecutionOptions) => GuardResult;
+  check: (args?: unknown, options?: ExecutionOptions) => Promise<GuardResult>;
   /** Guarded execution — runs the payload through vark, then the MCP server. */
   execute: (args?: unknown, options?: ExecutionOptions) => Promise<ToolExecutionResult>;
 }
@@ -212,7 +212,7 @@ export class VarkMCPAdapter {
         capabilities: guard.capabilities,
         compact: guard.compact,
         compression: guard.compression,
-        check: (args?: unknown, options?: ExecutionOptions): GuardResult => {
+        check: async (args?: unknown, options?: ExecutionOptions): Promise<GuardResult> => {
           const recorded = this.#violations.get(entry.name);
           if (recorded) {
             return { safe: false, blockedBy: 'DESCRIPTOR_PIN_VIOLATION', reason: recorded };

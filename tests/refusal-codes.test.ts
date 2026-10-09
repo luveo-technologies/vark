@@ -11,43 +11,43 @@ import { VarkRuntime } from '../packages/core/src/index.js';
  * - compact() is a single line (inline block comment, no \n split hazard)
  */
 describe('anomaly refusal causes', () => {
-  it('tags identical-call refusals with cause loop', () => {
+  it('tags identical-call refusals with cause loop', async () => {
     const guard = new AnomalyGuard({ maxIdenticalCalls: 1 });
-    guard.record('s', 'tool', { a: 1 });
-    const verdict = guard.record('s', 'tool', { a: 1 });
+    await guard.record('s', 'tool', { a: 1 });
+    const verdict = await guard.record('s', 'tool', { a: 1 });
     expect(verdict.safe).toBe(false);
     expect(verdict.cause).toBe('loop');
   });
 
-  it('tags velocity refusals with cause velocity', () => {
+  it('tags velocity refusals with cause velocity', async () => {
     const guard = new AnomalyGuard({ maxCallsPerMinute: 1, windowMs: 60_000 });
-    guard.record('s', 'a', {});
-    const verdict = guard.record('s', 'b', {});
+    await guard.record('s', 'a', {});
+    const verdict = await guard.record('s', 'b', {});
     expect(verdict.safe).toBe(false);
     expect(verdict.cause).toBe('velocity');
     expect(verdict.stats.halted).toBe(true);
   });
 
-  it('tags call-budget refusals with cause budget', () => {
+  it('tags call-budget refusals with cause budget', async () => {
     const guard = new AnomalyGuard({ maxTotalCalls: 1 });
-    guard.record('s', 'a', {});
-    const verdict = guard.record('s', 'b', {});
+    await guard.record('s', 'a', {});
+    const verdict = await guard.record('s', 'b', {});
     expect(verdict.safe).toBe(false);
     expect(verdict.cause).toBe('budget');
   });
 
-  it('preserves the original cause for already-halted sessions', () => {
+  it('preserves the original cause for already-halted sessions', async () => {
     const guard = new AnomalyGuard({ maxCallsPerMinute: 1, windowMs: 60_000 });
-    guard.record('s', 'a', {});
-    guard.record('s', 'b', {});
-    const verdict = guard.check('s', 'c', {});
+    await guard.record('s', 'a', {});
+    await guard.record('s', 'b', {});
+    const verdict = await guard.check('s', 'c', {});
     expect(verdict.safe).toBe(false);
     expect(verdict.cause).toBe('velocity');
   });
 
-  it('leaves cause undefined on safe verdicts', () => {
+  it('leaves cause undefined on safe verdicts', async () => {
     const guard = new AnomalyGuard({});
-    expect(guard.check('s', 'a', {}).cause).toBeUndefined();
+    expect((await guard.check('s', 'a', {})).cause).toBeUndefined();
   });
 });
 
@@ -99,7 +99,7 @@ describe('runtime refusal-code mapping', () => {
     const runtime = makeRuntime({ anomaly: { maxCallsPerMinute: 1 } });
     await runtime.execute('echo', { a: 1 }, { sessionId: 's' });
     await runtime.execute('echo', { b: 2 }, { sessionId: 's' });
-    const verdict = runtime.check('echo', { c: 3 }, { sessionId: 's' });
+    const verdict = await runtime.check('echo', { c: 3 }, { sessionId: 's' });
     expect(verdict.safe).toBe(false);
     expect(verdict.blockedBy).toBe('VELOCITY_EXCEEDED');
   });

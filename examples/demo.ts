@@ -303,7 +303,7 @@ async function main(): Promise<void> {
     await wrapped[1]!.execute({ query: 'firewalls; rm -rf /' }),
   );
 
-  const dryRun = wrapped[0]!.check({ url: 'https://evil.example.net/steal' });
+  const dryRun = await wrapped[0]!.check({ url: 'https://evil.example.net/steal' });
   console.log(
     `            ${dim('dry run:')} check() → safe=${dryRun.safe}, gate=${dryRun.blockedBy ?? '-'}`,
   );
@@ -345,7 +345,7 @@ async function main(): Promise<void> {
     const result = await runtime.execute('read_file', loopArgs, { sessionId: loopSession });
     printResult(`attempt ${attempt}/4`, result);
   }
-  const loopStats = runtime.anomaly.stats(loopSession);
+  const loopStats = await runtime.anomaly.stats(loopSession);
   if (loopStats) {
     console.log(
       `            ${dim('session:')} totalCalls=${loopStats.totalCalls} ` +

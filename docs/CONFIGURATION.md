@@ -165,7 +165,47 @@ interface AnomalyGuardConfig {
   sessionTTLMs?: number;          // idle TTL for sweepExpired(), default: 0 (off)
   freezeOnInjectionBlock?: boolean; // freeze session when gate 7 blocks, default: false
   enabled?: boolean;              // default: true
+  store?: StateStore;             // default: MemoryStateStore (in-process)
 }
+```
+
+## Session state store
+
+Per-session guard state (loop counters, velocity window, budgets, freeze
+flags) persists behind the `StateStore` interface using optimistic
+compare-and-swap: writes carry the version they read, a conflict reloads and
+re-evaluates so every call commits exactly once, and exhausted retries throw
+(the runtime refuses the call with `EXECUTION_ERROR` — a broken store fails
+closed).
+
+- **`MemoryStateStore`** (default) — single-process behaviour with LRU
+  eviction up to `maxSessions`.
+- **`RedisStateStore`** — shared state so N replicas enforce **one**
+  window instead of N copies of it. The client is injected: vark opens no
+  connections, so TLS, clusters and pooling stay your client's job.
+
+```ts
+import { RedisStateStore, VarkRuntime } from '@luveo-tech/vark';
+import Redis from 'ioredis';
+
+const redis = new Redis(process.env.REDIS_URL!);
+
+const runtime = new VarkRuntime({
+  anomaly: {
+    store: new RedisStateStore({
+      client: redis,               // ioredis exposes eval() natively
+      scan: (c, m, n) => redis.scan(c, 'MATCH', m, 'COUNT', n), // for sessions()/sweepExpired()
+      prefix: 'vark:session',      // key namespace (default)
+      ttlMs: 86_400_000,           // optional key TTL, refreshed per write
+    }),
+  },
+});
+```
+
+node-redis users wrap `eval` once (different argument shape):
+
+```ts
+client: { eval: (script, n, ...a) => redis.eval(script, { keys: a.slice(0, n), arguments: a.slice(n) }) },
 ```
 
 ## DlpConfig

@@ -225,8 +225,8 @@ them with `mode: 'block'`.
 new VarkRuntime({ anomaly: { maxIdenticalCalls: 3, maxCallsPerMinute: 30 } });
 
 await runtime.execute('read_file', { path: './a.json' }, { sessionId: 'agent-7' });
-runtime.anomaly.stats('agent-7');       // totalCalls, callsInWindow, tokens, halted
-runtime.resetSession('agent-7');
+await runtime.anomaly.stats('agent-7');   // totalCalls, callsInWindow, tokens, halted
+await runtime.resetSession('agent-7');
 ```
 
 Loop violations refuse only that call; velocity and budget violations **halt

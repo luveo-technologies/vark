@@ -8,6 +8,10 @@ import { resolveOutputFormat, writeEvent } from '../packages/core/src/cli/stream
 import { resolveIsolationMode, isTrueIsolationAvailable } from '../packages/core/src/isolated-vm.js';
 import { FileAuditSink } from '../packages/core/src/audit-sink.js';
 import { OtlpAuditExporter, toOtlpLogRecord, DEFAULT_OTLP_LOGS_ENDPOINT } from '../packages/core/src/otlp-exporter.js';
+import { MemoryStateStore } from '../packages/core/src/state-store.js';
+import type { SessionRecord, StateStore } from '../packages/core/src/state-store.js';
+import { RedisStateStore } from '../packages/core/src/redis-state-store.js';
+import { AnomalyGuard } from '../packages/core/src/anomaly-guard.js';
 import { VarkRuntime } from '../packages/core/src/index.js';
 import type { AuditEntry } from '../packages/core/src/types.js';
 
@@ -21,6 +25,9 @@ import type { AuditEntry } from '../packages/core/src/types.js';
  *    unpersistable audit trail with `audit.failClosed`) refuses instead of
  *    silently degrading.
  *  - P0: OTLP/HTTP exporter shipping audit records to any OTel collector.
+ *  - P0: pluggable state store — the anomaly guard persists behind a CAS
+ *    `StateStore` (memory default, `RedisStateStore` for shared limits
+ *    across replicas); conflicts reload-and-retry, exhaustion fails closed.
  */
 
 // isolated-vm is an OPTIONAL dependency and absent from CI: runtime-level
@@ -489,5 +496,227 @@ describe('OtlpAuditExporter', () => {
     const exporter = new OtlpAuditExporter({ flushIntervalMs: 0 });
     expect(DEFAULT_OTLP_LOGS_ENDPOINT).toBe('http://localhost:4318/v1/logs');
     void exporter.close();
+  });
+});
+
+// ── P0-1: pluggable state store (shared anomaly-guard state) ─────────────────
+
+function sessionRecord(id = 's'): SessionRecord {
+  return {
+    id,
+    createdAt: 1_000,
+    lastSeen: 1_000,
+    totalCalls: 0,
+    tokens: 0,
+    halted: false,
+    haltReason: '',
+    haltCause: '',
+    frozen: false,
+    frozenReason: '',
+    calls: [],
+    identical: {},
+  };
+}
+
+describe('MemoryStateStore CAS semantics', () => {
+  it('creates only when absent and version-guards every write', async () => {
+    const store = new MemoryStateStore();
+
+    expect(await store.save('s', sessionRecord(), undefined)).toBe(true);
+    expect(await store.save('s', sessionRecord(), undefined)).toBe(false); // exists
+    expect(await store.load('s')).toMatchObject({ version: 1 });
+
+    expect(await store.save('s', sessionRecord(), 99)).toBe(false); // stale writer
+    const record = sessionRecord();
+    record.totalCalls = 4;
+    expect(await store.save('s', record, 1)).toBe(true);
+    expect(await store.load('s')).toMatchObject({ version: 2, record: { totalCalls: 4 } });
+  });
+
+  it('hands out clones — caller edits never leak into the store', async () => {
+    const store = new MemoryStateStore();
+    await store.save('s', sessionRecord(), undefined);
+    const loaded = await store.load('s');
+    loaded!.record.totalCalls = 999;
+    expect((await store.load('s'))!.record.totalCalls).toBe(0);
+  });
+
+  it('evictOldest drops least-recently-used sessions beyond max', async () => {
+    const store = new MemoryStateStore();
+    for (const id of ['a', 'b', 'c']) await store.save(id, sessionRecord(id), undefined);
+    await store.load('a'); // touch → 'a' becomes most recent, 'b' oldest
+    store.evictOldest!(2);
+    const ids = (await store.list()).sort();
+    expect(ids).toEqual(['a', 'c']);
+  });
+
+  it('delete / clear / list round-trip', async () => {
+    const store = new MemoryStateStore();
+    await store.save('x', sessionRecord('x'), undefined);
+    await store.save('y', sessionRecord('y'), undefined);
+    expect((await store.list()).sort()).toEqual(['x', 'y']);
+    await store.delete('x');
+    expect(await store.list()).toEqual(['y']);
+    await store.clear();
+    expect(await store.list()).toEqual([]);
+  });
+});
+
+/** In-memory stand-in for a Redis server: interprets the store's three scripts. */
+function fakeRedis() {
+  const kv = new Map<string, string>();
+  const scripts: string[] = [];
+  const evalImpl = async (script: string, numberOfKeys: number, ...args: Array<string | number>) => {
+    scripts.push(script);
+    const keys = args.slice(0, numberOfKeys).map(String);
+    const argv = args.slice(numberOfKeys).map(String);
+    if (script.includes("redis.call('INCR', KEYS[2])")) {
+      // SAVE — CAS as the Lua script would: expected version, then write+INCR.
+      const current = kv.get(keys[1]!);
+      const expected = argv[0]!;
+      if (expected === '') {
+        if (current !== undefined) return 0;
+      } else if (current !== expected) {
+        return 0;
+      }
+      kv.set(keys[0]!, argv[1]!);
+      kv.set(keys[1]!, String(Number(current ?? '0') + 1));
+      return 1;
+    }
+    if (script.includes('local rec')) return [kv.get(keys[0]!) ?? null, kv.get(keys[1]!) ?? null];
+    let deleted = 0;
+    for (const key of keys) if (kv.delete(key)) deleted += 1;
+    return deleted;
+  };
+  const scan = async (): Promise<[string, string[]]> => ['0', [...kv.keys()]];
+  return { client: { eval: evalImpl }, scan, kv, scripts };
+}
+
+describe('RedisStateStore (injected client)', () => {
+  it('round-trips records through CAS with versions', async () => {
+    const { client } = fakeRedis();
+    const store = new RedisStateStore({ client });
+
+    expect(await store.save('s1', sessionRecord('s1'), undefined)).toBe(true);
+    expect(await store.save('s1', sessionRecord('s1'), undefined)).toBe(false); // exists
+
+    const loaded = await store.load('s1');
+    expect(loaded).toMatchObject({ version: 1, record: { id: 's1' } });
+
+    expect(await store.save('s1', sessionRecord('s1'), 7)).toBe(false); // stale
+    const updated = sessionRecord('s1');
+    updated.totalCalls = 2;
+    expect(await store.save('s1', updated, 1)).toBe(true);
+    expect((await store.load('s1'))!.version).toBe(2);
+
+    expect(await store.load('missing')).toBeUndefined();
+  });
+
+  it('namespaces keys under the configured prefix', async () => {
+    const { client, kv } = fakeRedis();
+    const store = new RedisStateStore({ client, prefix: 'guard' });
+    await store.save('s1', sessionRecord('s1'), undefined);
+    expect([...kv.keys()]).toEqual(['guard:s1', 'guard:s1:ver']);
+  });
+
+  it('list() scans (skipping version twins); delete removes both keys', async () => {
+    const { client, scan, kv } = fakeRedis();
+    const store = new RedisStateStore({ client, scan });
+    await store.save('s1', sessionRecord('s1'), undefined);
+    await store.save('s2', sessionRecord('s2'), undefined);
+    expect((await store.list()).sort()).toEqual(['s1', 's2']);
+
+    await store.delete('s1');
+    expect([...kv.keys()]).toEqual(['vark:session:s2', 'vark:session:s2:ver']);
+    await store.clear();
+    expect([...kv.keys()]).toEqual([]);
+  });
+
+  it('list() without a scan option throws an actionable error', async () => {
+    const { client } = fakeRedis();
+    const store = new RedisStateStore({ client });
+    await expect(store.list()).rejects.toThrow(/scan option/);
+  });
+
+  it('drives the anomaly guard end-to-end: loop, freeze, reset across the store', async () => {
+    const { client, scan } = fakeRedis();
+    const store = new RedisStateStore({ client, scan });
+    const guard = new AnomalyGuard({ maxIdenticalCalls: 1, store });
+
+    expect((await guard.record('agent', 'tool', { a: 1 })).safe).toBe(true);
+    const looped = await guard.record('agent', 'tool', { a: 1 });
+    expect(looped.safe).toBe(false);
+    expect(looped.cause).toBe('loop');
+
+    expect(await guard.freeze('agent', 'operator lock')).toBe(true);
+    expect((await guard.check('agent', 'other', {})).cause).toBe('frozen');
+    expect(await guard.freeze('missing', 'x')).toBe(false); // never creates
+
+    expect(await guard.sessions()).toEqual(['agent']);
+    await guard.reset('agent');
+    expect(await guard.sessions()).toEqual([]);
+    expect((await guard.check('agent', 'tool', {})).safe).toBe(true);
+  });
+
+  it('records usage through the store (addUsage charges the shared budget)', async () => {
+    const { client, scan } = fakeRedis();
+    const store = new RedisStateStore({ client, scan });
+    const guard = new AnomalyGuard({ store });
+    await guard.record('s', 'tool', {});
+    await guard.addUsage('s', 500);
+    expect((await guard.stats('s'))!.tokens).toBeGreaterThan(400);
+    await guard.addUsage('ghost', 500); // unknown session → no-op
+    expect(await guard.stats('ghost')).toBeUndefined();
+  });
+});
+
+describe('state contention (fail-closed)', () => {
+  /** Wraps a store, failing the first `failures` save attempts. */
+  function flaky(inner: StateStore, failures: number): StateStore {
+    let remaining = failures;
+    return {
+      load: (id) => inner.load(id),
+      save: async (id, record, version) => {
+        if (remaining > 0) {
+          remaining -= 1;
+          return false;
+        }
+        return inner.save(id, record, version);
+      },
+      delete: (id) => inner.delete(id),
+      clear: () => inner.clear(),
+      list: () => inner.list(),
+    };
+  }
+
+  it('reloads and retries through conflicts, committing each call exactly once', async () => {
+    const inner = new MemoryStateStore();
+    const guard = new AnomalyGuard({ maxIdenticalCalls: 5, store: flaky(inner, 2) });
+
+    expect((await guard.record('s', 'tool', {})).safe).toBe(true);
+    expect((await guard.stats('s'))!.totalCalls).toBe(1); // retried, not double-committed
+    expect((await guard.record('s', 'tool', {})).safe).toBe(true);
+    expect((await guard.stats('s'))!.totalCalls).toBe(2);
+  });
+
+  it('two concurrent same-session calls each commit exactly once (no aliasing)', async () => {
+    const guard = new AnomalyGuard({ maxIdenticalCalls: 10 });
+    const [a, b] = await Promise.all([guard.record('s', 'tool', {}), guard.record('s', 'tool', {})]);
+    expect(a.safe).toBe(true);
+    expect(b.safe).toBe(true);
+    expect((await guard.stats('s'))!.totalCalls).toBe(2);
+  });
+
+  it('exhausted retries throw — the runtime turns that into a refusal', async () => {
+    const inner = new MemoryStateStore();
+    const stuck: StateStore = {
+      load: (id) => inner.load(id),
+      save: async () => false,
+      delete: (id) => inner.delete(id),
+      clear: () => inner.clear(),
+      list: () => inner.list(),
+    };
+    const guard = new AnomalyGuard({ store: stuck });
+    await expect(guard.record('s', 'tool', {})).rejects.toThrow(/contention/);
   });
 });

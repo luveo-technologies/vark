@@ -186,7 +186,7 @@ program
     const started = Date.now();
     const iterations = Math.max(1, Number(options.iterations ?? 20000));
     try {
-      const report = runBench({ iterations });
+      const report = await runBench({ iterations });
       printBenchReport(report, Date.now() - started);
     } catch (error) {
       console.error(`${red('Error:')} ${error instanceof Error ? error.message : String(error)}`);

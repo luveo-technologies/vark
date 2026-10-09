@@ -97,9 +97,9 @@ describe('runtime pipeline parity (eval repros)', () => {
     expect(result.blockedBy).toBe('CIRCUIT_BREAKER');
   });
 
-  it('catches homoglyph payloads in the check() dry run too', () => {
+  it('catches homoglyph payloads in the check() dry run too', async () => {
     const runtime = makeRuntime();
-    const result = runtime.check('cmd', { command: '\uFF52\uFF4D \uFF0D\uFF52\uFF46 /' });
+    const result = await runtime.check('cmd', { command: '\uFF52\uFF4D \uFF0D\uFF52\uFF46 /' });
     expect(result.safe).toBe(false);
     expect(result.blockedBy).toBe('CIRCUIT_BREAKER');
   });

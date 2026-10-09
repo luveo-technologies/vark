@@ -213,7 +213,7 @@ async function runSingleCheck(
 
   // Use the check method for dry-run evaluation
   const checkOptions = identity ? { sessionId: identity } : undefined;
-  const result = runtime.check(tool, args, checkOptions);
+  const result = await runtime.check(tool, args, checkOptions);
 
   if (result.safe) {
     return {

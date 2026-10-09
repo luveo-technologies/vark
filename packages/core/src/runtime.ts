@@ -204,8 +204,8 @@ export class VarkRuntime {
   }
 
   /** Clear loop/velocity state for one session, or for all sessions. Also unfreezes. */
-  resetSession(sessionId?: string): void {
-    this.anomaly.reset(sessionId);
+  async resetSession(sessionId?: string): Promise<void> {
+    await this.anomaly.reset(sessionId);
   }
 
   /**
@@ -213,19 +213,19 @@ export class VarkRuntime {
    * `SESSION_FROZEN` until `resetSession()` clears it. Returns false when
    * the session does not exist.
    */
-  freezeSession(sessionId: string, reason?: string): boolean {
+  async freezeSession(sessionId: string, reason?: string): Promise<boolean> {
     return this.anomaly.freeze(sessionId, reason);
   }
 
   /** Run the guard pipeline without executing. Useful as a pre-flight check. */
-  check(name: string, args?: unknown, options?: ExecutionOptions): GuardResult {
+  async check(name: string, args?: unknown, options?: ExecutionOptions): Promise<GuardResult> {
     const wrapped = this.#tools.get(name);
     const sessionId = options?.sessionId ?? this.#session;
     if (!wrapped) {
       return { safe: false, blockedBy: 'EXECUTION_ERROR', reason: `unknown tool "${name}"` };
     }
 
-    const anomaly = this.anomaly.check(sessionId, name, args);
+    const anomaly = await this.anomaly.check(sessionId, name, args);
     if (!anomaly.safe) {
       const blockedBy = anomalyBlockedBy(anomaly.cause);
       return { safe: false, blockedBy, reason: anomaly.reason };
@@ -389,7 +389,7 @@ export class VarkRuntime {
     }
 
     // ── 1. Anomaly guard ────────────────────────────────────────────────
-    const anomaly = this.anomaly.record(sessionId, tool, args);
+    const anomaly = await this.anomaly.record(sessionId, tool, args);
     if (!anomaly.safe) {
       return commit(refusal(anomalyBlockedBy(anomaly.cause), anomaly.reason ?? 'anomaly guard refused the call'));
     }
@@ -527,7 +527,7 @@ export class VarkRuntime {
         if (injection.mode === 'block') {
           const message = reason ?? 'indirect prompt injection detected';
           if (this.config.anomaly.freezeOnInjectionBlock === true) {
-            this.anomaly.freeze(sessionId, message);
+            await this.anomaly.freeze(sessionId, message);
           }
           return commit(refusal('INDIRECT_INJECTION', message));
         }
@@ -537,7 +537,7 @@ export class VarkRuntime {
     }
 
     // Charge the round trip against the session token budget.
-    this.anomaly.addUsage(
+    await this.anomaly.addUsage(
       sessionId,
       estimateTokens(typeof data === 'string' ? data : stableStringify(data)),
     );

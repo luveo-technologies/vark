@@ -6,6 +6,7 @@
  */
 
 import type { HitlGate } from './gates/hitl-gate.js';
+import type { StateStore } from './state-store.js';
 
 /** Isolation backend used to run tool bodies. */
 export type IsolationMode = 'process' | 'wasm' | 'mock';
@@ -109,6 +110,12 @@ export interface AnomalyGuardConfig {
   maxSessionTokens?: number;
   /** Sessions kept in memory (least-recently-used evicted). @default 1_000 */
   maxSessions?: number;
+  /**
+   * Where per-session state lives. Defaults to in-process memory; plug a
+   * shared store (e.g. `RedisStateStore`) so loop/velocity/budget limits
+   * hold across N replicas of the same deployment.
+   */
+  store?: StateStore;
   /**
    * Idle-session TTL in ms. Sessions idle longer than this are dropped by
    * `sweepExpired()` (halted/frozen sessions are retained). @default 0 (off)

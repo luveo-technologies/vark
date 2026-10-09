@@ -94,12 +94,12 @@ describe('0.2.0 P1-C — MCP descriptor pin (rug-pull defense)', () => {
     expect(result.error).toContain('rug pull');
   });
 
-  it('mutating inputSchema mid-session also trips check()', () => {
+  it('mutating inputSchema mid-session also trips check()', async () => {
     const adapter = makeAdapter();
     const tools = makeTools();
     const [wrapped] = adapter.wrapTools(tools, { network: true });
     (tools[0]!.inputSchema as Record<string, unknown>)['evil'] = { type: 'string' };
-    const guard = wrapped!.check({ url: 'https://example.com' });
+    const guard = await wrapped!.check({ url: 'https://example.com' });
     expect(guard.safe).toBe(false);
     expect(guard.blockedBy).toBe('DESCRIPTOR_PIN_VIOLATION');
   });
@@ -193,33 +193,33 @@ describe('0.2.0 — HITL gate wired into the runtime', () => {
 // ── Session freeze + TTL ─────────────────────────────────────────────────────
 
 describe('0.2.0 — session freeze & TTL', () => {
-  it('freeze refuses with cause frozen until reset', () => {
+  it('freeze refuses with cause frozen until reset', async () => {
     const guard = new AnomalyGuard({});
-    guard.check('s1', 'tool', {});
-    guard.record('s1', 'tool', {});
+    await guard.check('s1', 'tool', {});
+    await guard.record('s1', 'tool', {});
 
-    expect(guard.freeze('s1', 'operator lock')).toBe(true);
-    const verdict = guard.check('s1', 'tool', {});
+    expect(await guard.freeze('s1', 'operator lock')).toBe(true);
+    const verdict = await guard.check('s1', 'tool', {});
     expect(verdict.safe).toBe(false);
     expect(verdict.cause).toBe('frozen');
     expect(verdict.stats.frozen).toBe(true);
 
     // freeze() does not create missing sessions
-    expect(guard.freeze('missing', 'x')).toBe(false);
+    expect(await guard.freeze('missing', 'x')).toBe(false);
 
-    guard.reset('s1');
-    expect(guard.check('s1', 'tool', {}).safe).toBe(true);
+    await guard.reset('s1');
+    expect((await guard.check('s1', 'tool', {})).safe).toBe(true);
   });
 
-  it('unfreeze lifts the lock without wiping counters', () => {
+  it('unfreeze lifts the lock without wiping counters', async () => {
     const guard = new AnomalyGuard({});
-    guard.record('s1', 'tool', {});
-    const callsBefore = guard.stats('s1')?.totalCalls ?? 0;
-    guard.freeze('s1');
-    expect(guard.unfreeze('s1')).toBe(true);
-    expect(guard.unfreeze('s1')).toBe(false); // not frozen anymore
-    expect(guard.check('s1', 'tool', {}).safe).toBe(true);
-    expect(guard.stats('s1')?.totalCalls).toBe(callsBefore);
+    await guard.record('s1', 'tool', {});
+    const callsBefore = (await guard.stats('s1'))?.totalCalls ?? 0;
+    await guard.freeze('s1');
+    expect(await guard.unfreeze('s1')).toBe(true);
+    expect(await guard.unfreeze('s1')).toBe(false); // not frozen anymore
+    expect((await guard.check('s1', 'tool', {})).safe).toBe(true);
+    expect((await guard.stats('s1'))?.totalCalls).toBe(callsBefore);
   });
 
   it('runtime freezeSession blocks execute with SESSION_FROZEN', async () => {
@@ -231,13 +231,13 @@ describe('0.2.0 — session freeze & TTL', () => {
       run: async () => 'data',
     });
     await runtime.execute('read', {}); // create the session
-    expect(runtime.freezeSession(DEFAULT_SESSION, 'canary trip')).toBe(true);
+    expect(await runtime.freezeSession(DEFAULT_SESSION, 'canary trip')).toBe(true);
 
     const result = await runtime.execute('read', {});
     expect(result.success).toBe(false);
     expect(result.blockedBy).toBe('SESSION_FROZEN');
 
-    runtime.resetSession(DEFAULT_SESSION);
+    await runtime.resetSession(DEFAULT_SESSION);
     expect((await runtime.execute('read', {})).success).toBe(true);
   });
 
@@ -262,27 +262,27 @@ describe('0.2.0 — session freeze & TTL', () => {
     expect(second.blockedBy).toBe('SESSION_FROZEN');
   });
 
-  it('sweepExpired drops idle sessions but retains halted and frozen ones', () => {
+  it('sweepExpired drops idle sessions but retains halted and frozen ones', async () => {
     const guard = new AnomalyGuard({ sessionTTLMs: 1_000 });
-    guard.record('idle', 'tool', {});
-    guard.record('halted', 'tool', {});
-    guard.record('frozen', 'tool', {});
-    guard.freeze('frozen');
+    await guard.record('idle', 'tool', {});
+    await guard.record('halted', 'tool', {});
+    await guard.record('frozen', 'tool', {});
+    await guard.freeze('frozen');
     // Halt 'halted' by blowing the velocity limit (record commits the call).
-    for (let i = 0; i < 40; i += 1) guard.record('halted', 'tool', { i });
+    for (let i = 0; i < 40; i += 1) await guard.record('halted', 'tool', { i });
 
-    const evicted = guard.sweepExpired(Date.now() + 10_000);
+    const evicted = await guard.sweepExpired(Date.now() + 10_000);
     expect(evicted).toBe(1);
-    expect(guard.stats('idle')).toBeUndefined();
-    expect(guard.stats('halted')?.halted).toBe(true);
-    expect(guard.stats('frozen')?.frozen).toBe(true);
+    expect(await guard.stats('idle')).toBeUndefined();
+    expect((await guard.stats('halted'))?.halted).toBe(true);
+    expect((await guard.stats('frozen'))?.frozen).toBe(true);
   });
 
-  it('sweepExpired is a no-op when TTL is off', () => {
+  it('sweepExpired is a no-op when TTL is off', async () => {
     const guard = new AnomalyGuard({});
-    guard.record('s1', 'tool', {});
-    expect(guard.sweepExpired(Date.now() + 1e12)).toBe(0);
-    expect(guard.stats('s1')).toBeDefined();
+    await guard.record('s1', 'tool', {});
+    expect(await guard.sweepExpired(Date.now() + 1e12)).toBe(0);
+    expect(await guard.stats('s1')).toBeDefined();
   });
 });
 
@@ -301,8 +301,8 @@ describe('0.2.0 — machine-readable quota codes', () => {
 // ── Per-gate bench ───────────────────────────────────────────────────────────
 
 describe('0.2.0 — per-gate benchmark rows', () => {
-  it('benchmarks every pipeline gate with sane numbers', () => {
-    const rows = runPerGateBench(50);
+  it('benchmarks every pipeline gate with sane numbers', async () => {
+    const rows = await runPerGateBench(50);
     expect(rows.length).toBeGreaterThanOrEqual(7);
     const gates = rows.map((r) => r.gate);
     for (const gate of ['anomaly', 'capability', 'breaker', 'schema', 'input-dlp', 'audit']) {

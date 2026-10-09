@@ -57,6 +57,10 @@ export {
 export type { AuditSink, AuditSinkOptions } from './audit-sink.js';
 export { OtlpAuditExporter, toOtlpLogRecord, DEFAULT_OTLP_LOGS_ENDPOINT } from './otlp-exporter.js';
 export type { OtlpExporterOptions, OtlpLogRecord, OtlpAttribute } from './otlp-exporter.js';
+export { MemoryStateStore } from './state-store.js';
+export type { StateStore, SessionRecord, LoadedSession } from './state-store.js';
+export { RedisStateStore } from './redis-state-store.js';
+export type { RedisStateStoreOptions, RedisEvalClient } from './redis-state-store.js';
 
 export {
   executeIsolated,

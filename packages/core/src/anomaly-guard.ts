@@ -16,10 +16,20 @@
  * `process.exit()` because a security guard must not crash its host. Halting
  * the session is the safe equivalent — the agent can no longer make progress,
  * while the operator keeps a live process and a readable audit trail.
+ *
+ * Session state lives behind a pluggable {@link StateStore}: the default
+ * `MemoryStateStore` is today's single-process behaviour, while a shared
+ * store (e.g. `RedisStateStore`) makes the limits hold across N replicas of
+ * the same deployment. All mutating operations are optimistic
+ * compare-and-swap with bounded reload-and-retry; if the store itself
+ * fails, the guard throws and the runtime refuses the call
+ * (`EXECUTION_ERROR`) — a broken state store fails closed, never open.
  */
 
 import { stableStringify } from './audit-logger.js';
 import { estimateTokens } from './compressor.js';
+import { MemoryStateStore } from './state-store.js';
+import type { SessionRecord, StateStore } from './state-store.js';
 import type { AnomalyGuardConfig } from './types.js';
 
 const DEFAULTS = {
@@ -30,6 +40,9 @@ const DEFAULTS = {
   maxSessionTokens: 250_000,
   maxSessions: 1_000,
 } as const;
+
+/** Reload-and-retry budget for compare-and-swap conflicts before failing closed. */
+const CAS_RETRIES = 8;
 
 export interface AnomalySessionStats {
   sessionId: string;
@@ -62,27 +75,6 @@ export interface AnomalyVerdict {
 /** Which anomaly check refused a call. */
 export type AnomalyCause = 'loop' | 'velocity' | 'budget' | 'frozen';
 
-interface CallRecord {
-  at: number;
-  fingerprint: string;
-}
-
-interface SessionState {
-  id: string;
-  createdAt: number;
-  lastSeen: number;
-  totalCalls: number;
-  tokens: number;
-  halted: boolean;
-  haltReason: string;
-  /** Why the session was halted. Empty string while open. */
-  haltCause: AnomalyCause | '';
-  frozen: boolean;
-  frozenReason: string;
-  calls: CallRecord[];
-  identical: Map<string, number>;
-}
-
 /** `tool` + canonical arguments — the identity of "the same call". */
 export function callFingerprint(toolName: string, args: unknown): string {
   return `${toolName}(${stableStringify(args)})`;
@@ -98,8 +90,8 @@ export class AnomalyGuard {
   readonly sessionTTLMs: number;
   readonly freezeOnInjectionBlock: boolean;
   readonly enabled: boolean;
-
-  readonly #sessions = new Map<string, SessionState>();
+  /** Where per-session state lives (memory by default, pluggable/shared). */
+  readonly store: StateStore;
 
   constructor(config: AnomalyGuardConfig = {}) {
     this.maxIdenticalCalls = config.maxIdenticalCalls ?? DEFAULTS.maxIdenticalCalls;
@@ -111,50 +103,66 @@ export class AnomalyGuard {
     this.sessionTTLMs = config.sessionTTLMs ?? 0;
     this.freezeOnInjectionBlock = config.freezeOnInjectionBlock ?? false;
     this.enabled = config.enabled !== false;
+    this.store = config.store ?? new MemoryStateStore();
   }
 
   /**
    * Evaluate a call against the session window **without** consuming a slot.
    * Used by the dry-run `runtime.check()`.
    */
-  check(sessionId: string, toolName: string, args: unknown): AnomalyVerdict {
-    const session = this.#session(sessionId);
-    return this.#evaluate(session, toolName, args, false);
+  async check(sessionId: string, toolName: string, args: unknown): Promise<AnomalyVerdict> {
+    const loaded = await this.#loadOrCreate(sessionId);
+    return this.#evaluate(loaded.record, toolName, args, false);
   }
 
   /**
    * Evaluate and then always account for the attempt (even when refused), so
    * an attacker cannot reset a velocity limit by making blocked calls.
    */
-  record(sessionId: string, toolName: string, args: unknown): AnomalyVerdict {
-    const session = this.#session(sessionId);
-    const verdict = this.#evaluate(session, toolName, args, true);
-    return verdict;
+  async record(sessionId: string, toolName: string, args: unknown): Promise<AnomalyVerdict> {
+    for (let attempt = 0; ; attempt++) {
+      const loaded = await this.#loadOrCreate(sessionId);
+      const verdict = this.#evaluate(loaded.record, toolName, args, true);
+      const created = loaded.version === undefined;
+      const saved = await this.store.save(sessionId, loaded.record, loaded.version);
+      if (saved) {
+        if (created) await this.store.evictOldest?.(this.maxSessions);
+        return verdict;
+      }
+      if (attempt >= CAS_RETRIES) {
+        throw new Error(
+          `anomaly guard: session "${sessionId}" state contention after ${CAS_RETRIES + 1} attempts — failing closed`,
+        );
+      }
+      // Conflict: another instance updated the session. Reload and
+      // re-evaluate against its state so no accounting is lost.
+    }
   }
 
   /** Charge output tokens against the session budget (called after execution). */
-  addUsage(sessionId: string, tokens: number): void {
-    const session = this.#sessions.get(sessionId);
-    if (session) session.tokens += Math.max(0, tokens);
+  async addUsage(sessionId: string, tokens: number): Promise<void> {
+    await this.#mutate(sessionId, (session) => {
+      session.tokens += Math.max(0, tokens);
+    });
   }
 
-  stats(sessionId: string): AnomalySessionStats | undefined {
-    const session = this.#sessions.get(sessionId);
-    if (!session) return undefined;
-    const last = session.calls[session.calls.length - 1];
+  async stats(sessionId: string): Promise<AnomalySessionStats | undefined> {
+    const loaded = await this.store.load(sessionId);
+    if (!loaded) return undefined;
+    const last = loaded.record.calls[loaded.record.calls.length - 1];
     const fingerprint = last?.fingerprint ?? '';
-    const uses = fingerprint ? (session.identical.get(fingerprint) ?? 0) : 0;
-    return this.#snapshot(session, fingerprint, uses);
+    const uses = fingerprint ? (loaded.record.identical[fingerprint] ?? 0) : 0;
+    return this.#snapshot(loaded.record, fingerprint, uses);
   }
 
-  sessions(): string[] {
-    return [...this.#sessions.keys()];
+  async sessions(): Promise<string[]> {
+    return this.store.list();
   }
 
   /** Reset one session (or every session when `sessionId` is omitted). Also unfreezes. */
-  reset(sessionId?: string): void {
-    if (sessionId === undefined) this.#sessions.clear();
-    else this.#sessions.delete(sessionId);
+  async reset(sessionId?: string): Promise<void> {
+    if (sessionId === undefined) await this.store.clear();
+    else await this.store.delete(sessionId);
   }
 
   /**
@@ -162,22 +170,22 @@ export class AnomalyGuard {
    * `'frozen'` until `reset()` clears it. Returns false when the session
    * does not exist (nothing is created).
    */
-  freeze(sessionId: string, reason = 'session frozen by operator'): boolean {
-    const session = this.#sessions.get(sessionId);
-    if (!session) return false;
-    session.frozen = true;
-    session.frozenReason = reason;
-    session.lastSeen = Date.now();
-    return true;
+  async freeze(sessionId: string, reason = 'session frozen by operator'): Promise<boolean> {
+    return this.#mutate(sessionId, (session) => {
+      session.frozen = true;
+      session.frozenReason = reason;
+      session.lastSeen = Date.now();
+    });
   }
 
   /** Lift a freeze without wiping counters. Returns false when not frozen. */
-  unfreeze(sessionId: string): boolean {
-    const session = this.#sessions.get(sessionId);
-    if (!session || !session.frozen) return false;
-    session.frozen = false;
-    session.frozenReason = '';
-    session.lastSeen = Date.now();
+  async unfreeze(sessionId: string): Promise<boolean> {
+    const loaded = await this.store.load(sessionId);
+    if (!loaded || !loaded.record.frozen) return false;
+    loaded.record.frozen = false;
+    loaded.record.frozenReason = '';
+    loaded.record.lastSeen = Date.now();
+    await this.#saveLoaded(sessionId, loaded);
     return true;
   }
 
@@ -186,28 +194,57 @@ export class AnomalyGuard {
    * are always retained — evicting them would silently resurrect a stopped
    * agent. Returns the number of sessions evicted. No-op when TTL is off.
    */
-  sweepExpired(now: number = Date.now()): number {
+  async sweepExpired(now: number = Date.now()): Promise<number> {
     if (this.sessionTTLMs <= 0) return 0;
     let evicted = 0;
-    for (const [id, session] of this.#sessions) {
-      if (session.halted || session.frozen) continue;
-      if (now - session.lastSeen > this.sessionTTLMs) {
-        this.#sessions.delete(id);
+    for (const id of await this.store.list()) {
+      const loaded = await this.store.load(id);
+      if (!loaded) continue;
+      if (loaded.record.halted || loaded.record.frozen) continue;
+      if (now - loaded.record.lastSeen > this.sessionTTLMs) {
+        await this.store.delete(id);
         evicted += 1;
       }
     }
     return evicted;
   }
 
-  #evaluate(
-    session: SessionState,
+  /** Load (or seed a transient record for) a session. Transient = not yet saved. */
+  async #loadOrCreate(id: string): Promise<{ record: SessionRecord; version: number | undefined }> {
+    const loaded = await this.store.load(id);
+    if (loaded) {
+      loaded.record.lastSeen = Date.now();
+      return loaded;
+    }
+    return { record: this.#seed(id, Date.now()), version: undefined };
+  }
+
+  #seed(id: string, now: number): SessionRecord {
+    return {
+      id,
+      createdAt: now,
+      lastSeen: now,
+      totalCalls: 0,
+      tokens: 0,
+      halted: false,
+      haltReason: '',
+      haltCause: '',
+      frozen: false,
+      frozenReason: '',
+      calls: [],
+      identical: {},
+    };
+  }
+
+  async #evaluate(
+    session: SessionRecord,
     toolName: string,
     args: unknown,
     consume: boolean,
-  ): AnomalyVerdict {
+  ): Promise<AnomalyVerdict> {
     const fingerprint = callFingerprint(toolName, args);
     const tokenCost = estimateTokens(fingerprint);
-    const identicalBefore = session.identical.get(fingerprint) ?? 0;
+    const identicalBefore = session.identical[fingerprint] ?? 0;
 
     const refuse = (reason: string, halt = false, cause: AnomalyCause = 'loop'): AnomalyVerdict => {
       if (halt && !session.halted) {
@@ -274,22 +311,42 @@ export class AnomalyGuard {
     return { safe: true, stats: this.#snapshot(session, fingerprint, identicalBefore + (consume ? 1 : 0)) };
   }
 
-  #commit(session: SessionState, fingerprint: string, tokenCost: number): void {
+  /**
+   * Mutate an existing session with CAS retry. Returns false (without
+   * creating anything) when the session does not exist.
+   */
+  async #mutate(id: string, mutate: (session: SessionRecord) => void): Promise<boolean> {
+    for (let attempt = 0; attempt <= CAS_RETRIES; attempt++) {
+      const loaded = await this.store.load(id);
+      if (!loaded) return false;
+      mutate(loaded.record);
+      if (await this.#saveLoaded(id, loaded)) return true;
+    }
+    throw new Error(
+      `anomaly guard: session "${id}" state contention after ${CAS_RETRIES + 1} attempts — failing closed`,
+    );
+  }
+
+  async #saveLoaded(id: string, loaded: { record: SessionRecord; version: number }): Promise<boolean> {
+    return this.store.save(id, loaded.record, loaded.version);
+  }
+
+  #commit(session: SessionRecord, fingerprint: string, tokenCost: number): void {
     const now = Date.now();
     session.totalCalls += 1;
     session.tokens += tokenCost;
     session.calls.push({ at: now, fingerprint });
-    session.identical.set(fingerprint, (session.identical.get(fingerprint) ?? 0) + 1);
+    session.identical[fingerprint] = (session.identical[fingerprint] ?? 0) + 1;
     session.lastSeen = now;
   }
 
-  #pruneWindow(session: SessionState): number {
+  #pruneWindow(session: SessionRecord): number {
     const cutoff = Date.now() - this.windowMs;
     while (session.calls.length > 0 && (session.calls[0]?.at ?? 0) < cutoff) session.calls.shift();
     return session.calls.length;
   }
 
-  #snapshot(session: SessionState, fingerprint: string, identicalCalls: number): AnomalySessionStats {
+  #snapshot(session: SessionRecord, fingerprint: string, identicalCalls: number): AnomalySessionStats {
     return {
       sessionId: session.id,
       totalCalls: session.totalCalls,
@@ -301,41 +358,5 @@ export class AnomalyGuard {
       frozen: session.frozen,
       frozenReason: session.frozenReason,
     };
-  }
-
-  #session(id: string): SessionState {
-    const now = Date.now();
-    const existing = this.#sessions.get(id);
-    if (existing) {
-      existing.lastSeen = now;
-      // Re-insert so Map insertion order doubles as least-recently-used order.
-      this.#sessions.delete(id);
-      this.#sessions.set(id, existing);
-      return existing;
-    }
-
-    const session: SessionState = {
-      id,
-      createdAt: now,
-      lastSeen: now,
-      totalCalls: 0,
-      tokens: 0,
-      halted: false,
-      haltReason: '',
-      haltCause: '',
-      frozen: false,
-      frozenReason: '',
-      calls: [],
-      identical: new Map(),
-    };
-    this.#sessions.set(id, session);
-
-    while (this.#sessions.size > this.maxSessions) {
-      const oldest = this.#sessions.keys().next();
-      if (oldest.done || oldest.value === undefined) break;
-      this.#sessions.delete(oldest.value);
-    }
-
-    return session;
   }
 }

@@ -86,8 +86,8 @@ describe('vark scan', () => {
 });
 
 describe('vark bench', () => {
-  it('reports within budget on small iterations', () => {
-    const report = runBench({ iterations: 500 });
+  it('reports within budget on small iterations', async () => {
+    const report = await runBench({ iterations: 500 });
     expect(report.iterations).toBe(500);
     expect(report.withinBudget).toBe(true);
     expect(report.p99Ms).toBeLessThan(1);

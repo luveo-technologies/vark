@@ -21,7 +21,7 @@ const tools = adapter.wrapTools(mcpTools, {
 });
 
 await tools[0].execute({ url: 'https://evil.example.net' }); // → CAPABILITY_VIOLATION
-tools[0].check({ url: 'https://docs.example.com' });         // dry run, no server call
+tools[0].check({ url: 'https://docs.example.com' });         // dry run, no server call (await it)
 tools[0].compact;                                            // CTP signature
 ```
 

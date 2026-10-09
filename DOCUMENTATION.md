@@ -259,7 +259,7 @@ for (let i = 0; i < 4; i += 1) {
   //               (maxIdenticalCalls=3 per session, "agent-7") fingerprint read_file({"path":"./a.json"})
 }
 
-runtime.anomaly.stats('agent-7');
+await runtime.anomaly.stats('agent-7');
 // { sessionId: 'agent-7', totalCalls: 4, callsInWindow: 4, identicalCalls: 4,
 //   tokens: 122, halted: false, haltReason: '', frozen: false, frozenReason: '' }
 ```
@@ -658,8 +658,8 @@ The resolved configuration is available as `runtime.config` (`ResolvedVarkConfig
 | `runtime.anomaly` | `readonly AnomalyGuard` | Per-session loop/velocity state (§4.8) |
 | `runtime.session` | `get string` | Current default session id |
 | `runtime.setSession(id)` | method | Switch the default session |
-| `runtime.resetSession(id?)` | method | Clear one session (or all) from the anomaly guard; also unfreezes |
-| `runtime.freezeSession(id, reason?)` | method | Administratively lock a session (`SESSION_FROZEN` until reset); `false` if unknown |
+| `runtime.resetSession(id?)` | async method | Clear one session (or all) from the anomaly guard; also unfreezes |
+| `runtime.freezeSession(id, reason?)` | async method | Administratively lock a session (`SESSION_FROZEN` until reset); `false` if unknown |
 
 #### Registration
 
@@ -758,11 +758,11 @@ blocked.error;             // 'path "../../etc/passwd" is outside the filesystem
 Runs gates 1–3 **without executing and without consuming an anomaly slot**:
 
 ```ts
-check(name, args?, options?): GuardResult   // { safe: boolean; reason?: string; blockedBy?: BlockedBy }
+check(name, args?, options?): Promise<GuardResult>   // { safe: boolean; reason?: string; blockedBy?: BlockedBy }
 ```
 
 ```ts
-const verdict = runtime.check('read_file', { path: '../../etc/passwd' });
+const verdict = await runtime.check('read_file', { path: '../../etc/passwd' });
 // { safe: false, blockedBy: 'CAPABILITY_VIOLATION', reason: 'path … is outside …' }
 ```
 
@@ -838,22 +838,49 @@ INJECTION_MARKER;  // '[REMOVED:INDIRECT_INJECTION]'
 | `maxTotalCalls` | `number` | `1_000` | Lifetime call budget |
 | `maxSessionTokens` | `number` | `250_000` | Lifetime estimated-token budget |
 | `maxSessions` | `number` | `1_000` | Sessions held in memory (LRU eviction) |
+| `store` | `StateStore` | memory | Pluggable session state — `MemoryStateStore` default, `RedisStateStore` for shared limits across replicas |
 | `enabled` | `boolean` | `true` | `false` disables gate 1 |
 
 ```ts
-runtime.anomaly.check(sessionId, tool, args): AnomalyVerdict   // pure — no slot consumed
-runtime.anomaly.record(sessionId, tool, args): AnomalyVerdict  // evaluate + account for the attempt
-runtime.anomaly.addUsage(sessionId, tokens): void              // charge output tokens
-runtime.anomaly.stats(sessionId): AnomalySessionStats | undefined
-runtime.anomaly.sessions(): string[]
-runtime.anomaly.reset(sessionId?): void
-callFingerprint(toolName, args): string                        // exported helper
+runtime.anomaly.check(sessionId, tool, args): Promise<AnomalyVerdict>   // pure — no slot consumed
+runtime.anomaly.record(sessionId, tool, args): Promise<AnomalyVerdict>  // evaluate + account for the attempt
+runtime.anomaly.addUsage(sessionId, tokens): Promise<void>              // charge output tokens
+runtime.anomaly.stats(sessionId): Promise<AnomalySessionStats | undefined>
+runtime.anomaly.sessions(): Promise<string[]>
+runtime.anomaly.reset(sessionId?): Promise<void>
+runtime.anomaly.freeze(sessionId, reason?): Promise<boolean>            // admin lock; false if unknown
+runtime.anomaly.unfreeze(sessionId): Promise<boolean>                   // lift lock, keep counters
+runtime.anomaly.sweepExpired(now?): Promise<number>                     // TTL eviction, 0 when off
+callFingerprint(toolName, args): string                                 // exported helper
 ```
 
 `AnomalySessionStats`:
-`{ sessionId, totalCalls, callsInWindow, identicalCalls, tokens, halted, haltReason }`.
+`{ sessionId, totalCalls, callsInWindow, identicalCalls, tokens, halted, haltReason, frozen, frozenReason }`.
 
-`AnomalyVerdict`: `{ safe: boolean; reason?: string; stats: AnomalySessionStats }`.
+`AnomalyVerdict`: `{ safe: boolean; reason?: string; cause?: AnomalyCause; stats: AnomalySessionStats }`.
+
+**Pluggable state store (since 0.2.0-beta.3).** Session state persists
+behind the `StateStore` interface with optimistic compare-and-swap: every
+write carries the version it read, a conflicting write reloads and
+re-evaluates (each call commits exactly once), and exhausted retries throw —
+the runtime turns that into an `EXECUTION_ERROR` refusal, so a broken or
+contended store fails **closed**. The default `MemoryStateStore` is the
+single-process behaviour; plug `RedisStateStore` so N replicas share one
+loop/velocity/budget window:
+
+```ts
+import { RedisStateStore, VarkRuntime } from '@luveo-tech/vark';
+
+const runtime = new VarkRuntime({
+  anomaly: {
+    store: new RedisStateStore({
+      client: redis,                    // any ioredis-compatible client (injected — no new deps)
+      scan: (cursor, match, count) => redis.scan(cursor, 'MATCH', match, 'COUNT', count),
+      ttlMs: 24 * 60 * 60_000,          // optional key TTL
+    }),
+  },
+});
+```
 
 ### 4.9 `AuditLoggerConfig` and `AuditLogger`
 
@@ -989,6 +1016,10 @@ KmsAuditSigner, FileAuditSink, StreamAuditSink, MultiAuditSink, createDefaultAud
 OtlpAuditExporter, toOtlpLogRecord, DEFAULT_OTLP_LOGS_ENDPOINT
 type AuditAppendInput, AuditVerifyResult, AuditSink, AuditSinkOptions,
 OtlpExporterOptions, OtlpLogRecord, OtlpAttribute
+
+// session state store (gate 1 — pluggable, shared across replicas)
+MemoryStateStore, RedisStateStore
+type StateStore, SessionRecord, LoadedSession, RedisStateStoreOptions, RedisEvalClient
 
 // execution & isolation (gate 5)
 DEFAULT_MAX_EXECUTION_MS, createSandbox, inspectArguments, withTimeout,
@@ -1364,9 +1395,9 @@ await runtime.execute('read_file', args, { sessionId: 'agent-7' });
 runtime.setSession('agent-7');
 await runtime.execute('read_file', args);
 
-runtime.anomaly.stats('agent-7');
-runtime.anomaly.sessions();     // ['default', 'agent-7']
-runtime.resetSession('agent-7'); // clear loop/velocity state when the agent finishes
+await runtime.anomaly.stats('agent-7');
+await runtime.anomaly.sessions();     // ['default', 'agent-7']
+await runtime.resetSession('agent-7'); // clear loop/velocity state when the agent finishes
 ```
 
 ### Hardening profile (deny-by-default)
@@ -1445,7 +1476,7 @@ const read = runtime.tool({ /* … */ });
 
 expect((await read.execute({ path: './workspace/data.json' })).success).toBe(true);
 expect((await read.execute({ path: '../../etc/passwd' })).blockedBy).toBe('CAPABILITY_VIOLATION');
-expect(runtime.check('read_file', { path: '../../etc/passwd' }).safe).toBe(false);
+expect((await runtime.check('read_file', { path: '../../etc/passwd' })).safe).toBe(false);
 expect(runtime.inspect({ command: 'x; rm -rf /' }).safe).toBe(false);
 expect(runtime.audit.verify()).toEqual({ ok: true, checked: 3 });
 expect(redactText('AKIA…')).toContain('[REDACTED_SECRET: AWS_KEY]');
