@@ -10,7 +10,18 @@ import { watch } from 'node:fs';
 import { runCheck, printCheckResults } from './commands/check.js';
 import { runAuditVerify, printVerifyResult, runTail, exportAudit, loadEntries } from './commands/audit.js';
 import type { ExportFormat } from './commands/audit.js';
-import { runPolicyTest, printTestResults } from './commands/policy.js';
+import {
+  runPolicyTest,
+  printTestResults,
+  signPolicyFile,
+  verifyPolicyFile,
+  generatePolicyKeyFiles,
+  diffPolicyFiles,
+  printPolicySign,
+  printPolicyVerify,
+  printPolicyKeygen,
+  printPolicyDiff,
+} from './commands/policy.js';
 import { runScan, printScanResult } from './commands/scan.js';
 import { runBench, printBenchReport } from './commands/bench.js';
 import {
@@ -296,45 +307,63 @@ policyCmd
   .command('test <policy>')
   .description('Execute unit test assertions against a declarative policy file')
   .option('--output-format <format>', 'Output format: text (default) | streaming-json (NDJSON)', 'text')
-  .action(async (policy: string, options: { outputFormat?: string }) => {
-    let streaming: boolean;
-    try {
-      streaming = resolveOutputFormat(options.outputFormat) === 'streaming-json';
-    } catch (error) {
-      console.error(`${red('Error:')} ${error instanceof Error ? error.message : String(error)}`);
-      process.exitCode = 1;
-      return;
-    }
-    const started = Date.now();
-    try {
-      const results = await runPolicyTest(policy, { quiet: streaming });
-      if (streaming) {
-        for (const result of results.results) {
-          writeEvent({ type: 'result', command: 'policy-test', ...result });
-        }
-        writeEvent({
-          type: 'summary',
-          command: 'policy-test',
-          passed: results.passed,
-          failed: results.failed,
-          ok: results.failed === 0,
-          elapsedMs: Date.now() - started,
-        });
-        if (results.failed > 0) process.exitCode = 1;
-      } else {
-        printTestResults(results, Date.now() - started);
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (streaming) {
-        writeEvent({ type: 'error', command: 'policy-test', message });
+  .option('--key <publicKeyPem>', 'Pin signature verification to this public key PEM')
+  .option('--require-signature', 'Fail unless the policy carries a valid signature bundle')
+  .option('--skip-signature', 'Skip automatic verification of an existing <policy>.sig')
+  .action(
+    async (
+      policy: string,
+      options: {
+        outputFormat?: string;
+        key?: string;
+        requireSignature?: boolean;
+        skipSignature?: boolean;
+      },
+    ) => {
+      let streaming: boolean;
+      try {
+        streaming = resolveOutputFormat(options.outputFormat) === 'streaming-json';
+      } catch (error) {
+        console.error(`${red('Error:')} ${error instanceof Error ? error.message : String(error)}`);
         process.exitCode = 1;
         return;
       }
-      console.error(`${red('Error:')} ${message}`);
-      process.exit(1);
-    }
-  });
+      const started = Date.now();
+      try {
+        const results = await runPolicyTest(policy, {
+          quiet: streaming,
+          keyPath: options.key,
+          requireSignature: options.requireSignature,
+          skipSignature: options.skipSignature,
+        });
+        if (streaming) {
+          for (const result of results.results) {
+            writeEvent({ type: 'result', command: 'policy-test', ...result });
+          }
+          writeEvent({
+            type: 'summary',
+            command: 'policy-test',
+            passed: results.passed,
+            failed: results.failed,
+            ok: results.failed === 0,
+            elapsedMs: Date.now() - started,
+          });
+          if (results.failed > 0) process.exitCode = 1;
+        } else {
+          printTestResults(results, Date.now() - started);
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (streaming) {
+          writeEvent({ type: 'error', command: 'policy-test', message });
+          process.exitCode = 1;
+          return;
+        }
+        console.error(`${red('Error:')} ${message}`);
+        process.exit(1);
+      }
+    },
+  );
 
 policyCmd
   .command('lint <policy>')
@@ -357,6 +386,69 @@ policyCmd
     } catch (error) {
       console.error(`${red('Error:')} ${error instanceof Error ? error.message : String(error)}`);
       process.exit(1);
+    }
+  });
+
+policyCmd
+  .command('keygen [out]')
+  .description('Generate an Ed25519 key pair for policy signing (writes PEM files)')
+  .action(async (out?: string) => {
+    try {
+      printPolicyKeygen(await generatePolicyKeyFiles({ out }));
+    } catch (error) {
+      console.error(`${red('Error:')} ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(1);
+    }
+  });
+
+policyCmd
+  .command('sign <policy>')
+  .description('Sign the exact bytes of a policy file (writes <policy>.sig)')
+  .requiredOption('--key <privateKeyPem>', 'Path to the PKCS#8 Ed25519 private key PEM (see policy keygen)')
+  .option('--out <sig>', 'Signature bundle output path (default <policy>.sig)')
+  .action(async (policy: string, options: { key: string; out?: string }) => {
+    try {
+      printPolicySign(
+        await signPolicyFile(policy, { keyPath: options.key, outPath: options.out }),
+      );
+    } catch (error) {
+      console.error(`${red('Error:')} ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(1);
+    }
+  });
+
+policyCmd
+  .command('verify <policy>')
+  .description('Verify a policy signature bundle (tamper + drift detection)')
+  .option('--key <publicKeyPem>', 'Pin verification to this public key PEM')
+  .option('--sig <path>', 'Signature bundle path (default <policy>.sig)')
+  .action(async (policy: string, options: { key?: string; sig?: string }) => {
+    const started = Date.now();
+    try {
+      const outcome = await verifyPolicyFile(policy, {
+        keyPath: options.key,
+        sigPath: options.sig,
+      });
+      printPolicyVerify(outcome, Date.now() - started); // sets exitCode 1 when !ok
+    } catch (error) {
+      console.error(`${red('Error:')} ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(1);
+    }
+  });
+
+policyCmd
+  .command('diff <a> <b>')
+  .description('Structural diff of two policy files — exit 1 on drift, exit 2 on error')
+  .action(async (a: string, b: string) => {
+    const started = Date.now();
+    try {
+      const { entries, a: aLabel, b: bLabel } = await diffPolicyFiles(a, b);
+      printPolicyDiff(entries, aLabel, bLabel, Date.now() - started);
+      if (entries.length > 0) process.exitCode = 1; // drift
+    } catch (error) {
+      // Exit 2 so CI can tell drift (1) from unreadable input (2).
+      console.error(`${red('Error:')} ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(2);
     }
   });
 

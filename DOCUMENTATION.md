@@ -1021,6 +1021,11 @@ OtlpExporterOptions, OtlpLogRecord, OtlpAttribute
 MemoryStateStore, RedisStateStore
 type StateStore, SessionRecord, LoadedSession, RedisStateStoreOptions, RedisEvalClient
 
+// signed policy bundles & drift detection
+signPolicy, verifyPolicy, generatePolicyKeyPair, hashPolicy, policyKeyId,
+diffPolicy, POLICY_SIGNATURE_ALG
+type PolicySignature, VerifyResult, PolicyDiffEntry
+
 // execution & isolation (gate 5)
 DEFAULT_MAX_EXECUTION_MS, createSandbox, inspectArguments, withTimeout,
 executeInSandbox, createSandboxedFunction, executeIsolated, resolveIsolationMode,
@@ -1368,6 +1373,10 @@ vark audit export audit.jsonl --format html -o report.html
 vark policy test policy.vark.json  # shouldAllow/shouldBlock assertions
 vark policy lint policy.vark.json  # static validation
 vark policy init ./policies        # scaffold starter policy
+vark policy keygen keys/policy     # Ed25519 pair for signing
+vark policy sign policy.vark.json --key keys/policy.key.pem
+vark policy verify policy.vark.json --key keys/policy.pub.pem   # drift/tamper gate
+vark policy diff baseline.json deployed.json                    # structural drift (exit 1)
 vark canary                        # honeytoken trap demo
 vark pii leaked.txt                # PII anonymization preview
 vark entropy page.html             # prompt-leak reflection report

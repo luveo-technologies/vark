@@ -1,9 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { runCheck } from '../packages/core/src/cli/commands/check.js';
-import { runPolicyTest } from '../packages/core/src/cli/commands/policy.js';
+import { runPolicyTest, signPolicyFile, verifyPolicyFile, diffPolicyFiles, generatePolicyKeyFiles } from '../packages/core/src/cli/commands/policy.js';
+import { policyKeyId } from '../packages/core/src/policy-signature.js';
+import { diffPolicy } from '../packages/core/src/policy-diff.js';
 import { runScan } from '../packages/core/src/cli/commands/scan.js';
 import { runBench, assertBenchBudget } from '../packages/core/src/cli/commands/bench.js';
 import { resolveOutputFormat, writeEvent } from '../packages/core/src/cli/stream.js';
@@ -774,5 +776,177 @@ describe('vark bench --max-p99', () => {
   it('defaults to the 1ms sub-millisecond budget', async () => {
     const report = await runBench({ iterations: 100, gateIterations: 10 });
     expect(report.budgetMs).toBe(1);
+  });
+});
+
+// ── beta.3 additions: signed policy bundles, policy diff ─────────────────────
+
+describe('signed policy bundles', () => {
+  const policyBody = JSON.stringify({ config: {}, tools: [], tests: [] });
+
+  async function keyFixture(name: string): Promise<{ privateKeyPath: string; publicKeyPath: string }> {
+    return generatePolicyKeyFiles({ out: join(FIXTURE_DIR, name) });
+  }
+
+  it('keygen writes parseable Ed25519 PEM files', async () => {
+    const keys = await keyFixture('k1');
+    expect(await readFile(keys.privateKeyPath, 'utf8')).toContain('BEGIN PRIVATE KEY');
+    expect(await readFile(keys.publicKeyPath, 'utf8')).toContain('BEGIN PUBLIC KEY');
+    expect(policyKeyId(await readFile(keys.publicKeyPath, 'utf8'))).toMatch(/^sha256:[0-9a-f]{64}$/);
+  });
+
+  it('sign → verify round-trips on unchanged bytes (pinned and embedded key)', async () => {
+    const policyPath = await writeFixture('signed.json', policyBody);
+    const keys = await keyFixture('k2');
+    const signed = await signPolicyFile(policyPath, { keyPath: keys.privateKeyPath });
+    expect(signed.sigPath).toBe(`${policyPath}.sig`);
+    expect(signed.policyHash).toMatch(/^sha256:[0-9a-f]{64}$/);
+
+    const embedded = await verifyPolicyFile(policyPath);
+    expect(embedded.ok).toBe(true);
+    expect(embedded.signature!.keyId).toBe(signed.keyId);
+
+    const pinned = await verifyPolicyFile(policyPath, { keyPath: keys.publicKeyPath });
+    expect(pinned.ok).toBe(true);
+  });
+
+  it('reports "unsigned" when no bundle exists', async () => {
+    const policyPath = await writeFixture('unsigned.json', policyBody);
+    const outcome = await verifyPolicyFile(policyPath);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reason).toBe('unsigned');
+  });
+
+  it('detects byte drift after signing', async () => {
+    const policyPath = await writeFixture('drift.json', policyBody);
+    const keys = await keyFixture('k3');
+    await signPolicyFile(policyPath, { keyPath: keys.privateKeyPath });
+
+    await writeFile(policyPath, `${policyBody} `, 'utf8'); // trailing space — still valid JSON
+    const outcome = await verifyPolicyFile(policyPath);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reason).toBe('drift');
+    expect(outcome.detail).toContain('changed since signing');
+  });
+
+  it('detects a forged signature over valid bytes', async () => {
+    const policyPath = await writeFixture('forged.json', policyBody);
+    const keys = await keyFixture('k4');
+    await signPolicyFile(policyPath, { keyPath: keys.privateKeyPath });
+
+    const sig = JSON.parse(await readFile(`${policyPath}.sig`, 'utf8')) as {
+      signature: string;
+    };
+    const bytes = Buffer.from(sig.signature, 'base64');
+    bytes[0] = (bytes[0] ?? 0) ^ 0xff;
+    await writeFile(
+      `${policyPath}.sig`,
+      JSON.stringify({ ...sig, signature: bytes.toString('base64') }),
+      'utf8',
+    );
+
+    const outcome = await verifyPolicyFile(policyPath);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reason).toBe('bad-signature');
+  });
+
+  it('reports wrong-key when the pinned key is not the signer', async () => {
+    const policyPath = await writeFixture('pinned.json', policyBody);
+    const signer = await keyFixture('k5a');
+    const other = await keyFixture('k5b');
+    await signPolicyFile(policyPath, { keyPath: signer.privateKeyPath });
+
+    const outcome = await verifyPolicyFile(policyPath, { keyPath: other.publicKeyPath });
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reason).toBe('wrong-key');
+    expect(outcome.detail).toContain('signed with a different key');
+  });
+
+  it('policy test auto-verifies: valid passes, drifted refuses to run', async () => {
+    const policyPath = await writeFixture('signed-run.json', policyBody);
+    const keys = await keyFixture('k6');
+    await signPolicyFile(policyPath, { keyPath: keys.privateKeyPath });
+
+    const ok = await runPolicyTest(policyPath, { quiet: true });
+    expect(ok.results).toHaveLength(0);
+
+    await writeFile(policyPath, `${policyBody} `, 'utf8');
+    await expect(runPolicyTest(policyPath, { quiet: true })).rejects.toThrow(
+      /signature verification failed \(drift\)/,
+    );
+    // …and the pin applies too
+    await expect(
+      runPolicyTest(policyPath, { keyPath: keys.publicKeyPath, skipSignature: false }),
+    ).rejects.toThrow(/signature verification failed/);
+  });
+
+  it('policy test --require-signature rejects unsigned policies; flags are exclusive', async () => {
+    const policyPath = await writeFixture('require.json', policyBody);
+    await expect(runPolicyTest(policyPath, { requireSignature: true })).rejects.toThrow(
+      /--require-signature/,
+    );
+    await expect(
+      runPolicyTest(policyPath, { requireSignature: true, skipSignature: true }),
+    ).rejects.toThrow(/cannot be combined/);
+    // default (no bundle, no requirement) is fine
+    await expect(runPolicyTest(policyPath, { quiet: true })).resolves.toMatchObject({
+      results: [],
+    });
+  });
+});
+
+describe('policy diff / drift detection', () => {
+  const before = {
+    config: { anomaly: { maxIdenticalCalls: 3, enabled: true } },
+    tools: [{ name: 'read_file' }],
+    tests: [{ name: 't1', tool: 'read_file', shouldAllow: true }],
+  };
+  const after = {
+    config: { anomaly: { maxIdenticalCalls: 5, enabled: true, maxSessions: 10 } },
+    tools: [{ name: 'read_file' }, { name: 'fetch_page' }],
+    tests: [{ name: 't1', tool: 'read_file', shouldAllow: false }],
+  };
+
+  it('reports changes, additions and array growth with JSON paths', () => {
+    const entries = diffPolicy(before, after);
+    expect(entries.map((e) => `${e.kind} ${e.path}`)).toEqual([
+      'changed config.anomaly.maxIdenticalCalls',
+      'added config.anomaly.maxSessions',
+      'changed tests[0].shouldAllow',
+      'added tools[1]',
+    ]);
+    const tuned = entries.find((e) => e.path === 'config.anomaly.maxIdenticalCalls')!;
+    expect(tuned.before).toBe(3);
+    expect(tuned.after).toBe(5);
+  });
+
+  it('is symmetric: reverting the diff reports removals', () => {
+    const entries = diffPolicy(after, before);
+    expect(entries.map((e) => `${e.kind} ${e.path}`)).toEqual([
+      'changed config.anomaly.maxIdenticalCalls',
+      'removed config.anomaly.maxSessions',
+      'changed tests[0].shouldAllow',
+      'removed tools[1]',
+    ]);
+  });
+
+  it('identical documents diff to nothing', () => {
+    expect(diffPolicy(before, structuredClone(before))).toEqual([]);
+  });
+
+  it('flags type changes as leaf changes', () => {
+    expect(diffPolicy({ a: 1, b: 'x' }, { a: '1', b: 'y' })).toEqual([
+      { path: 'a', kind: 'changed', before: 1, after: '1' },
+      { path: 'b', kind: 'changed', before: 'x', after: 'y' },
+    ]);
+  });
+
+  it('diffPolicyFiles reads both files and throws on missing input', async () => {
+    const a = await writeFixture('policy-a.json', JSON.stringify(before));
+    const b = await writeFixture('policy-b.json', JSON.stringify(after));
+    const { entries, a: aLabel } = await diffPolicyFiles(a, b);
+    expect(aLabel).toBe(a);
+    expect(entries).toHaveLength(4);
+    await expect(diffPolicyFiles(a, join(FIXTURE_DIR, 'missing.json'))).rejects.toThrow(/ENOENT|no such file/i);
   });
 });

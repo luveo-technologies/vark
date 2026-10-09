@@ -54,6 +54,10 @@ vark audit export audit.jsonl --format html -o report.html
 vark policy test policy.vark.json
 vark policy lint policy.vark.json
 vark policy init ./policies
+vark policy keygen keys/policy
+vark policy sign policy.vark.json --key keys/policy.key.pem
+vark policy verify policy.vark.json --key keys/policy.pub.pem
+vark policy diff baseline.json deployed.json
 vark canary
 vark pii leaked.txt
 vark entropy page.html --context "system prompt text…"
@@ -130,13 +134,19 @@ streaming-friendly), full-field CSV (decision, reason, findings, prevHash,
 sanitizedInputs, untruncated hashes), or a single-file styled HTML report.
 `[log]` defaults to `$VARK_AUDIT_PATH`.
 
-### `vark policy test <policy> [--output-format <format>]`
+### `vark policy test <policy> [--output-format <format>] [--key <pub>] [--require-signature] [--skip-signature]`
 
 Run `shouldAllow`/`shouldBlock` assertions against a declarative policy file
 (tools + tests, JSON). Each tool's `run` string is compiled and executed for
 real, so assertions exercise the same gates a live call would hit. Prints
 per-test ✓/✗ with expected-vs-actual diffs and a pass-rate bar. Exit 1 on
 any failure.
+
+If a signature bundle `<policy>.sig` exists it is **verified before the
+policy is parsed or executed** — a drifted or tampered file refuses to run.
+`--key <pub>` pins verification to your public key, `--require-signature`
+makes an unsigned policy a failure, `--skip-signature` opts out entirely
+(the last two cannot be combined).
 
 ### `vark policy lint <policy>`
 
@@ -146,6 +156,36 @@ need name/tool/boolean shouldAllow, and every test tool must be defined.
 ### `vark policy init [dir]`
 
 Scaffold a starter `policy.vark.json` (one tool, two tests).
+
+### `vark policy keygen [out]`
+
+Generate an Ed25519 key pair for policy signing: `<out>.key.pem` (private,
+written mode 600) and `<out>.pub.pem` (public). Default prefix
+`vark-policy-key`.
+
+### `vark policy sign <policy> --key <private.pem> [--out <sig>]`
+
+Sign the **exact bytes** of a policy file and write the detached bundle
+`<policy>.sig` (`alg`, `keyId`, embedded public key, `policyHash`, Ed25519
+`signature`, `signedAt`). Any later byte change to the policy breaks
+verification — that is the drift detection.
+
+### `vark policy verify <policy> [--key <pub.pem>] [--sig <path>]`
+
+Verify the bundle against the current file bytes. Failure reasons:
+`unsigned` (no bundle), `malformed` (unparseable bundle/key),
+`wrong-key` (pinned key is not the signer), `drift` (bytes changed since
+signing), `bad-signature`. Exit 1 on failure. Without `--key` the bundle's
+embedded public key is used — integrity without origin. With `--key`, only
+your pinned signer counts (the enterprise mode).
+
+### `vark policy diff <a> <b>`
+
+Structural diff of two policy JSON files: every leaf change with a JSON
+path — `~ config.anomaly.maxIdenticalCalls: 3 → 5`,
+`+ config.anomaly.maxSessions = 1000`, `- tools[1] = …`. Built for CI drift
+gates: **exit 0 = identical, exit 1 = drift, exit 2 = error** (read/parse
+failure), so a missing file can never masquerade as a passing comparison.
 
 ### `vark canary`
 

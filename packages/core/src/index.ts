@@ -61,6 +61,17 @@ export { MemoryStateStore } from './state-store.js';
 export type { StateStore, SessionRecord, LoadedSession } from './state-store.js';
 export { RedisStateStore } from './redis-state-store.js';
 export type { RedisStateStoreOptions, RedisEvalClient } from './redis-state-store.js';
+export {
+  signPolicy,
+  verifyPolicy,
+  generatePolicyKeyPair,
+  hashPolicy,
+  policyKeyId,
+  POLICY_SIGNATURE_ALG,
+} from './policy-signature.js';
+export type { PolicySignature, VerifyResult } from './policy-signature.js';
+export { diffPolicy } from './policy-diff.js';
+export type { PolicyDiffEntry } from './policy-diff.js';
 
 export {
   executeIsolated,
