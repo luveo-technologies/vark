@@ -1,6 +1,6 @@
 # vark
 
-> ⚠️ **Under active development — v0.2.0-beta.2.** This project is functional but
+> ⚠️ **Under active development — v0.2.0-beta.3.** This project is functional but
 > pre-release: expect bugs, sharp edges, and breaking changes between
 > versions. Do not rely on it as your sole security boundary in production
 > yet. Found something? Report it — see
@@ -89,7 +89,7 @@ gapped machine — without publishing to npm:
 
 ```bash
 pnpm build            # dist/ must exist in both packages
-pnpm pack:local       # → local-pack/*.tgz, workspace:* deps rewritten to 0.2.0-beta.2
+pnpm pack:local       # → local-pack/*.tgz, workspace:* deps rewritten to 0.2.0-beta.3
 ```
 
 Then in any consumer project, install **both** tarballs in one command so
@@ -97,8 +97,8 @@ npm resolves the MCP adapter's `@luveo-tech/vark` dependency from the local
 core tarball instead of the registry:
 
 ```bash
-npm install ../Vark/local-pack/luveo-tech-vark-0.2.0-beta.2.tgz \
-            ../Vark/local-pack/luveo-tech-vark-mcp-0.2.0-beta.2.tgz
+npm install ../Vark/local-pack/luveo-tech-vark-0.2.0-beta.3.tgz \
+            ../Vark/local-pack/luveo-tech-vark-mcp-0.2.0-beta.3.tgz
 ```
 
 (Inside this monorepo no packing is needed — `pnpm install` links the

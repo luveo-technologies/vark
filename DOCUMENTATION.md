@@ -1750,10 +1750,11 @@ that cannot cross an isolate boundary; configuring the runtime with
 this. Nothing degrades silently.
 
 **Is `vark` published to npm?**
-Yes — `@luveo-tech/vark` and `@luveo-tech/vark-mcp` are on npm (0.1.0 /
-0.1.1 published; this release is `0.2.0-beta.2`, a prerelease of the 0.2.0
-line pending evaluation sign-off). Inside this monorepo the packages
-are consumed via `workspace:*`.
+Yes — `@luveo-tech/vark` and `@luveo-tech/vark-mcp` are on npm: the stable
+line sits at `0.1.3` under the `latest` dist-tag, and this release is
+`0.2.0-beta.3` under `beta`, a prerelease of the 0.2.0 line pending
+evaluation sign-off. Inside this monorepo the packages are consumed via
+`workspace:*`.
 
 ---
 

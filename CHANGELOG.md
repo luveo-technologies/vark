@@ -5,6 +5,93 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0-beta.3] - 2026-10-09
+
+Third prerelease cut — a robustness and enterprise-integration round: five
+hardening items (replica-safe state, OTLP audit export, streaming NDJSON
+output, fail-closed dependency loss, release SBOMs) plus ten feature
+additions spanning signed policies, adaptive risk, HITL quorum approvals,
+break-glass, session replay, audit anchoring, scan/bench ergonomics and
+corporate-proxy egress. Same promotion path as `0.2.0-beta.1`/`beta.2`: on
+sign-off this content ships stable — the `0.2.0` slot on npm is already
+taken, so the stable cut will be renumbered; only the version/tag changes.
+
+### Added
+
+- **Pluggable anomaly-guard state store:** `MemoryStateStore` /
+  `RedisStateStore` behind a `StateStore` interface — loop / velocity /
+  session state can be shared across replicas instead of process-local.
+- **OTLP/HTTP audit exporter:** `OtlpAuditExporter` (+ `toOtlpLogRecord`)
+  streams hash-chained entries to any OpenTelemetry collector alongside the
+  file and SIEM sinks.
+- **Fail-closed on dependency loss:** a broken isolate backend refuses new
+  calls with `ISOLATION_UNAVAILABLE`, and a failing audit sink under
+  `audit.failClosed` refuses with `AUDIT_UNAVAILABLE` — nothing degrades
+  silently.
+- **`--output-format streaming-json`** for `check`, `scan`, `policy test`
+  and `session stats` — one NDJSON event per line for log shippers.
+- **CycloneDX SBOM as a release asset:** CI publishes `sbom.json` on every
+  version tag.
+- **Signed policy bundles:** Ed25519 `signPolicy`/`verifyPolicy` +
+  `hashPolicy`/`policyKeyId`, so a deployed policy proves its provenance
+  before it gates anything.
+- **`vark policy diff <a> <b>`:** structural drift between two policies
+  (added/removed/changed paths) — exit 1 on drift as a deploy-time gate.
+- **Adaptive per-tool risk:** `AdaptiveRiskAssessor` scores each tool from
+  its own history-decayed block rate and escalates refusals through gate
+  4b `risk:<tool>` tiers (configured `hitl` handles the escalation).
+- **Break-glass mode:** time-boxed, fully audited operator override for the
+  anomaly and HITL gates (`runtime.breakGlass.enable(...)`); detection
+  gates are never bypassed and every transition lands in the audit trail.
+- **Webhook HITL quorum:** approval requests fan out to multiple webhook
+  endpoints, signed `x-vark-signature` (HMAC-SHA256); `quorum: { required,
+  approvers }` counts distinct approvers, a single denial vetoes.
+- **`vark session replay <log>`:** per-session call-by-call timeline —
+  offsets from session start, seq numbers, decision chips, redaction
+  counters, findings, sanitized inputs and refusal reasons — with
+  `--session`/`--from`/`--to`/`--limit` filters and `streaming-json`
+  output. Exit 1 when nothing matched (same contract as `session stats`).
+- **`vark bench --max-p99 <ms>`** (p99 budget as an exit-code gate) and
+  **`vark scan --direction output`** (reverse prompt-injection scanning of
+  model outputs, not just inputs).
+- **Corporate forward proxy for `ctx.sandbox.fetch`:** `VarkConfig.proxy`
+  (`{ url, noProxy?, useEnv? }` or `false`) plus the standard
+  `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` env vars — absolute-form requests
+  for `http://` targets, `CONNECT` tunnel with end-to-end TLS for
+  `https://` targets, `Proxy-Authorization` derived from proxy URL
+  credentials. Capability allowlists and the SSRF baseline still run
+  before any socket opens; a malformed proxy URL throws instead of
+  silently going direct. No config, no env → direct, unchanged.
+- **`vark audit anchor <log>` + anchor core (`verifyAuditChain`,
+  `createAuditAnchor`, `checkAuditAnchors`):** an external checkpoint of
+  the trail head (`{ seq, hash, anchoredAt, totalEntries }`) in an
+  append-only `<log>.anchors.jsonl` sidecar (`--out`), optionally POSTed
+  to a `--webhook` witness (signed). `--check` later proves truncation,
+  in-place edits or a wholesale rewrite that the in-log chain alone
+  cannot see (a ring-buffer trim and an attack look identical from
+  inside). Fail-closed — a broken chain is never attested — and
+  idempotent: re-anchoring an unchanged head reports "already anchored".
+
+### Fixed
+
+- **`vark audit verify` always reported HMAC-signed trails as
+  CORRUPTED:** the CLI recomputed links with plain SHA-256 while
+  `audit.hmacKey` signs with HMAC-SHA256. It now reads
+  `VARK_AUDIT_HMAC_KEY`, verifies with it, and fails closed without the
+  key (hint printed on failure).
+- **`vark audit verify` rejected ring-buffer-trimmed logs:** verification
+  now starts from the log's first record, matching the in-process
+  `AuditLogger.verify()` contract, so a trimmed log is no longer a false
+  alarm — detecting records that are *gone* is exactly what
+  `vark audit anchor --check` does with ground truth.
+
+### Changed
+
+- New beta.3 regression suite (state store, OTLP, streaming JSON,
+  fail-closed codes, signed policies + drift, adaptive risk, break-glass,
+  quorum fan-out, replay, anchors, proxy transport incl. live CONNECT/TLS
+  e2e) — full battery now 336 tests across 15 files.
+
 ## [0.2.0-beta.2] - 2026-10-08
 
 Second prerelease cut, incorporating the next adversarial-eval round plus CI

@@ -27,25 +27,25 @@ their README/docs. Judge everything black-box, by documented behavior.
 
 - Node.js ≥ 20 available (`node --version`).
 - Network access to https://registry.npmjs.org.
-- Run: `npm install @luveo-tech/vark@0.2.0-beta.2` in your scratch dir.
+- Run: `npm install @luveo-tech/vark@0.2.0-beta.3` in your scratch dir.
   - If this 404s, **STOP** and report "PACKAGE NOT PUBLISHED" — do not proceed.
   - **Pre-publish alternative:** the repository owner can hand you local
     tarballs built with `pnpm pack:local` (see README → "Install from a
     local build"); install both in one command:
-    `npm install <path>/luveo-tech-vark-0.2.0-beta.2.tgz <path>/luveo-tech-vark-mcp-0.2.0-beta.2.tgz`.
+    `npm install <path>/luveo-tech-vark-0.2.0-beta.3.tgz <path>/luveo-tech-vark-mcp-0.2.0-beta.3.tgz`.
 
 ### Phase 1 — Install & smoke test (~10 min)
 
 1. Install the library locally and the MCP bridge:
-   `npm install @luveo-tech/vark-mcp@0.2.0-beta.2`.
-2. Install the CLI globally: `npm install -g @luveo-tech/vark@0.2.0-beta.2`, then run
+   `npm install @luveo-tech/vark-mcp@0.2.0-beta.3`.
+2. Install the CLI globally: `npm install -g @luveo-tech/vark@0.2.0-beta.3`, then run
    `vark --help` and `vark doctor`. Both must exit 0.
    - If npm fails with `EEXIST …/npm/vark`, a stale shim is in the way —
-     retry with `npm install -g --force @luveo-tech/vark@0.2.0-beta.2`.
-   - Also try the zero-install path: `npx -p @luveo-tech/vark@0.2.0-beta.2 vark --help`.
-   - Always pin the exact version (currently `@0.2.0-beta.2`): prereleases sit
+     retry with `npm install -g --force @luveo-tech/vark@0.2.0-beta.3`.
+   - Also try the zero-install path: `npx -p @luveo-tech/vark@0.2.0-beta.3 vark --help`.
+   - Always pin the exact version (currently `@0.2.0-beta.3`): prereleases sit
      under a `beta` dist-tag, so unversioned installs resolve to the old
-     `latest` (0.1.1) — wrong build.
+     `latest` (0.1.3) — wrong build.
 3. Report: did install work first try? Were there warnings, peer-dep errors,
    or confusing output? Is `vark doctor` all green?
 
